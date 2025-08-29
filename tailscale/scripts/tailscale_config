@@ -1,0 +1,295 @@
+#!/bin/sh
+# Merlin 380 - Tailscale controller (dbus-driven, role & SNAT aware)
+# - 无参数: 按 dbus 开关应用（enable=1 => start/restart；否则 stop）
+# - 子命令: start|stop|restart|status
+# 状态持久化: /koolshare/configs/tailscaled.state
+# 套接字:     /var/run/tailscale/tailscaled.sock
+# 日志:       /tmp/tailscale_daemon.log, /tmp/tailscale_up.log
+# 状态页:     /tmp/tailscale_status.txt, /tmp/tailscale_netcheck.txt
+# 保险丝版改动要点：
+#   1) 初次/保守运行使用 --netfilter-mode=off（完全不让 tailscale 改防火墙）
+#   2) 我们自己建 TSFWD/TSNAT 两个链，并用 -A 追加，不破坏已有链头规则
+#   3) 启动后 8 秒内检测管理口可达，不通则自动回滚（撤规则+down+kill）
+#   4) 以后确认稳定后，可把 build_up_flags 里的 --netfilter-mode=off 改回 nodivert
+
+alias echo_date='echo 【$(TZ=UTC-8 date -R +%Y年%m月%d日\ %X)】:'
+
+KSROOT="/koolshare"
+BIN="${KSROOT}/bin"
+STATE_DIR="${KSROOT}/configs/tailscale"
+RUN_DIR="/var/run/tailscale"
+SOCK="${RUN_DIR}/tailscaled.sock"
+STATE="${STATE_DIR}/tailscaled.state"
+TS="${BIN}/tailscale"
+TSD="${BIN}/tailscaled"
+
+STATUS_TXT="/tmp/tailscale_status.txt"
+NETCHECK_TXT="/tmp/tailscale_netcheck.txt"
+TSDLOG="/tmp/tailscale_daemon.log"
+TSUPLOG="/tmp/tailscale_up.log"
+
+need_dirs() { mkdir -p "${STATE_DIR}" "${RUN_DIR}" /tmp >/dev/null 2>&1; }
+
+# ===== helpers: base64 与校验 =====
+b64_enc() { openssl base64 -A 2>/dev/null; }                       # stdin -> base64(单行)
+b64_dec() { tr -d '\r\n\t ' | openssl base64 -d -A 2>/dev/null; }  # stdin -> 解码
+looks_like_tskey() { printf '%s' "$1" | grep -q '^tskey-'; }       # 明文形态校验
+
+# 运行时安全取用（返回明文 tskey-；失败返回非0）
+get_authkey_decoded() {
+  local raw dec
+  raw="$(dbus get tailscale_authkey 2>/dev/null | tr -d '\r\n\t ')"
+  [ -z "$raw" ] && return 1
+
+  dec="$(printf '%s' "$raw" | b64_dec || true)"
+  if looks_like_tskey "$dec"; then
+    printf '%s' "$dec"; return 0
+  fi
+  # 兼容：若 dbus 里是明文
+  if looks_like_tskey "$raw"; then
+    printf '%s' "$raw"; return 0
+  fi
+  return 1
+}
+
+# 一次性迁移：若 dbus 里是明文 tskey-，转成 base64 存回；其他情况不动
+migrate_authkey_to_b64() {
+  local raw dec
+  raw="$(dbus get tailscale_authkey 2>/dev/null | tr -d '\r\n\t ')"
+  [ -z "$raw" ] && return 0
+  dec="$(printf '%s' "$raw" | b64_dec || true)"
+  if looks_like_tskey "$dec"; then
+    return 0  # 已是b64，不动
+  elif looks_like_tskey "$raw"; then
+    dbus set tailscale_authkey="$(printf '%s' "$raw" | b64_enc)"
+  else
+    echo_date "提示：dbus 中 tailscale_authkey 不是有效 tskey-，已忽略。"
+  fi
+}
+
+# ---------- 读取 dbus（角色 / NAT 开关 等） ----------
+get_conf() {
+  tailscale_enable="$(dbus get tailscale_enable)";           [ -z "${tailscale_enable}" ] && tailscale_enable=0
+  tailscale_ipv4_enable="$(dbus get tailscale_ipv4_enable)"; [ -z "${tailscale_ipv4_enable}" ] && tailscale_ipv4_enable=1
+  tailscale_ipv6_enable="$(dbus get tailscale_ipv6_enable)"; [ -z "${tailscale_ipv6_enable}" ] && tailscale_ipv6_enable=1
+
+  tailscale_advertise_exit="$(dbus get tailscale_advertise_exit)"; [ -z "${tailscale_advertise_exit}" ] && tailscale_advertise_exit=0
+  tailscale_advertise_routes="$(dbus get tailscale_advertise_routes)"
+
+  # 角色与 NAT
+  tailscale_role="$(dbus get tailscale_role)";               # 1=网关(子网路由), 2=终端, 3=混合
+
+  tailscale_SNAT_enable="$(dbus get tailscale_SNAT_enable)"; # 0=off, 1=on（仅对 server/both 的 tailscale0->LAN 生效）
+  [ -z "${tailscale_SNAT_enable}" ] && tailscale_SNAT_enable=0
+}
+
+# ---------- 组装 tailscale up 参数（accept-routes 由 role 推导） ----------
+build_up_flags() {
+  # 我们自己管防火墙
+  UP_FLAGS="--accept-dns=false --netfilter-mode=nodivert --accept-routes=true"
+
+  # 广播子网：网关/混合用 UI 值；终端明确清空，避免历史残留
+  case "$tailscale_role" in
+    1|3)
+      if [ -n "$tailscale_advertise_routes" ]; then
+        UP_FLAGS="$UP_FLAGS --advertise-routes=$tailscale_advertise_routes"
+      fi
+      ;;
+    2)
+      UP_FLAGS="$UP_FLAGS --advertise-routes="
+      ;;
+  esac
+
+  # 出口节点（按 UI）
+  [ "$tailscale_advertise_exit" = "1" ] && UP_FLAGS="$UP_FLAGS --advertise-exit-node"
+
+  echo "$UP_FLAGS"
+}
+
+
+LAN_IF="$(nvram get lan_ifname)"
+[ -z "$LAN_IF" ] && LAN_IF="br0"
+
+TS_NET4="${TAILSCALE_NET4:-100.64.0.0/10}"   # 如需自定义，可在环境或 dbus 注入 TAILSCALE_NET4
+
+# ---------- 流量放行 & NAT（按角色/开关应用） ----------
+enable_forwarding() {
+  # 仅放行 tailscale0 -> 本机（所有角色都需要）
+  iptables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i tailscale0 -j ACCEPT
+
+  case "$tailscale_role" in
+    2) # 终端：不做任何转发/NAT（保持“只自己用”）
+       return 0
+       ;;
+
+    1|3) # 网关 或 混合：需要转发/NAT
+       # 1) 内核开关
+       echo 1 > /proc/sys/net/ipv4/ip_forward
+       [ -f /proc/sys/net/ipv4/conf/all/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+       [ -f /proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter ]  && echo 2 > /proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter
+       [ -f /proc/sys/net/ipv4/conf/tailscale0/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter
+
+       # 2) 自定义链 + 跳转（仅一次）
+       iptables -N TSFWD 2>/dev/null
+       iptables -t nat -N TSNAT 2>/dev/null
+       iptables -C FORWARD -j TSFWD 2>/dev/null || iptables -A FORWARD -j TSFWD
+       iptables -t nat -C POSTROUTING -j TSNAT 2>/dev/null || iptables -t nat -A POSTROUTING -j TSNAT
+
+       # 3) TSFWD：已建立优先 + tailscale0 <-> LAN 双向
+       iptables -C TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+         || iptables -A TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+       iptables -C TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT 2>/dev/null || iptables -A TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+       iptables -C TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT 2>/dev/null || iptables -A TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+
+       # 4) TSNAT：按角色/开关打 SNAT
+       #   - role=1/3：允许 tailnet -> LAN 的 SNAT（可控）
+       if [ "${tailscale_SNAT_enable}" = "1" ]; then
+         iptables -t nat -C TSNAT -s "${TS_NET4}" -o ${LAN_IF} -j MASQUERADE 2>/dev/null \
+           || iptables -t nat -A TSNAT -s "${TS_NET4}" -o ${LAN_IF} -j MASQUERADE
+       fi
+
+       #   - role=3（混合）：LAN 也允许借 tailscale0 出去（出口/反向）
+       if [ "$tailscale_role" = "3" ]; then
+         iptables -t nat -C TSNAT -o tailscale0 -j MASQUERADE 2>/dev/null \
+           || iptables -t nat -A TSNAT -o tailscale0 -j MASQUERADE
+       fi
+       ;;
+  esac
+}
+
+disable_forwarding() {
+  # 撤 INPUT 放行（幂等删除）
+  while iptables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null; do
+    iptables -D INPUT -i tailscale0 -j ACCEPT
+  done
+
+  # 撤 FORWARD -> TSFWD 跳转及链
+  if iptables -C FORWARD -j TSFWD 2>/dev/null; then
+    iptables -D FORWARD -j TSFWD 2>/dev/null
+  fi
+  iptables -F TSFWD 2>/dev/null
+  iptables -X TSFWD 2>/dev/null
+
+  # 撤 nat/POSTROUTING -> TSNAT 跳转及链
+  if iptables -t nat -C POSTROUTING -j TSNAT 2>/dev/null; then
+    iptables -t nat -D POSTROUTING -j TSNAT 2>/dev/null
+  fi
+  iptables -t nat -F TSNAT 2>/dev/null
+  iptables -t nat -X TSNAT 2>/dev/null
+
+  # 兜底：把可能残留的直挂 SNAT 也撤掉
+  iptables -t nat -D POSTROUTING -s "${TS_NET4}" -o ${LAN_IF} -j MASQUERADE 2>/dev/null
+  iptables -t nat -D POSTROUTING -o tailscale0 -j MASQUERADE 2>/dev/null
+}
+
+
+# ---------- 运行控制 ----------
+start_ts() {
+  need_dirs
+  get_conf
+
+  if [ ! -x "${TSD}" ] || [ ! -x "${TS}" ]; then
+    echo_date "缺少二进制：${BIN}/{tailscaled,tailscale}"
+    return 1
+  fi
+
+  if ! pidof tailscaled >/dev/null 2>&1; then
+    echo_date "启动 tailscaled ..."
+    "${TSD}" --state="${STATE}" --statedir="${STATE_DIR}" --socket="${SOCK}" --port=41641 > "${TSDLOG}" 2>&1 &
+    sleep 2
+  else
+    echo_date "tailscaled 已在运行"
+  fi
+
+  UP_FLAGS="$(build_up_flags)"
+  echo_date "执行 tailscale up ${UP_FLAGS}"
+
+  # 安全获取明文 tskey-；失败则不带 --authkey
+  TS_UP_AUTH=""
+  if _AK="$(get_authkey_decoded)"; then
+    TS_UP_AUTH="--authkey=${_AK}"
+  fi
+  unset _AK
+
+  if [ -n "${TS_UP_AUTH}" ]; then
+    "${TS}" up ${UP_FLAGS} ${TS_UP_AUTH} > "${TSUPLOG}" 2>&1
+    RET=$?
+  else
+    "${TS}" up ${UP_FLAGS} > "${TSUPLOG}" 2>&1
+    RET=$?
+  fi
+
+  if [ $RET -ne 0 ]; then
+    echo_date "tailscale up 失败（代码 $RET），查看 ${TSUPLOG}"
+    return $RET
+  fi
+
+  enable_forwarding
+
+  # ===== 保险丝：启动后 8 秒内确认管理口可达（ping 网关 IP）=====
+  local GW_IP="$(nvram get lan_ipaddr 2>/dev/null)"
+  ok=0
+  i=0
+  while [ $i -lt 4 ]; do
+    ping -c1 -W2 "$GW_IP" >/dev/null 2>&1 && { ok=1; break; }
+    i=$((i+1))
+    sleep 2
+  done
+  if [ "$ok" -ne 1 ]; then
+    echo_date "保险丝触发：管理口 $GW_IP 不通，回滚规则并停服务！"
+    stop_ts
+    return 1
+  fi
+
+  "${TS}" status > "${STATUS_TXT}" 2>&1
+  echo_date "启动完成"
+}
+
+stop_ts() {
+  echo_date "停止 tailscale ..."
+  if pidof tailscaled >/dev/null 2>&1; then
+    killall tailscaled >/dev/null 2>&1
+    sleep 1
+  fi
+  if [ -x "${TS}" ]; then
+    "${TS}" down >/dev/null 2>&1
+  fi
+  disable_forwarding
+  rm -f "${SOCK}"
+  echo_date "已停止"
+}
+
+status_ts() {
+  need_dirs
+  [ -x "${TS}" ] && "${TS}" status > "${STATUS_TXT}" 2>&1 && cat "${STATUS_TXT}" || echo "tailscale 不存在：${TS}"
+}
+
+apply_ts() {
+  migrate_authkey_to_b64
+  get_conf
+  if [ "${tailscale_enable}" = "1" ]; then
+    if pidof tailscaled >/dev/null 2>&1; then
+      stop_ts; start_ts
+    else
+      start_ts
+    fi
+  else
+    stop_ts
+  fi
+}
+
+cmd="$1"
+if [ -z "$cmd" ]; then
+  apply_ts
+  exit $?
+fi
+
+case "$cmd" in
+  start)   start_ts ;;
+  stop)    stop_ts ;;
+  restart) stop_ts; start_ts ;;
+  status)  status_ts ;;
+  *)       apply_ts ;;
+esac
+
+exit 0

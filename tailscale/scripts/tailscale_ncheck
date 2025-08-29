@@ -1,0 +1,14 @@
+#!/bin/sh
+TS="/koolshare/bin/tailscale"
+
+alias echo_date='echo 【$(TZ=UTC-8 date -R +%Y年%m月%d日\ %X)】:'
+
+echo_date "执行 tailscale netcheck ..."
+
+if [ ! -x "$TS" ]; then
+  echo_date "tailscale 不存在或不可执行：$TS"
+  exit 1
+fi
+
+"$TS" netcheck 2>&1
+

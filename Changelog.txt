@@ -1,0 +1,6 @@
+Koolshare Asuswrt-Merlin ZeroTier Changelog for merlin 380 armv5 platform
+===========================================
+
+1.0.0
+   - add	Tailscale插件上线，基于wiregurad协议的零配置内网穿透安全组网工具！
+  

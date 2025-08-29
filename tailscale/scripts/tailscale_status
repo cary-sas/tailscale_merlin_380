@@ -1,0 +1,326 @@
+#!/bin/sh
+# tailscale_status: 显示本路由器 Tailscale IP 及与其它客户端通讯协议
+TS="/koolshare/bin/tailscale"
+source /koolshare/scripts/base.sh
+
+alias echo_date='echo 【$(TZ=UTC-8 date -R +%Y年%m月%d日\ %X)】:'
+
+echo_date "获取 tailscale status ..."
+
+if [ ! -x "$TS" ]; then
+  echo_date "tailscale 不存在或不可执行：$TS"
+  exit 1
+fi
+
+if pidof tailscaled >/dev/null 2>&1; then
+  echo_date "tailscaled 进程正在运行：$(pidof tailscaled)"
+else
+  echo_date "tailscaled 未运行！"
+fi
+
+
+# 输出本机 Tailscale IP
+MYIP=$($TS ip -4 2>/dev/null)
+if [ -n "$MYIP" ]; then
+  echo_date "本机 Tailscale IPv4: $MYIP"
+else
+  echo_date "未获取到本机 Tailscale IPv4"
+fi
+
+# 输出与其它节点通讯协议
+echo_date "与其它节点通讯协议："
+
+$TS status --json 2>/dev/null | jq -r '
+  def first_v4(a): ( [a[]? | select(index(":")|not)] | first ) // "";
+  def first_v6(a): ( [a[]? | select(index(":"))]       | first ) // "";
+
+  def row:
+    { Peer: .HostName,
+      Online: (.Online // false),
+      Relay: (.Relay // ""),
+      Direct: ((.CurAddr // "") != ""),
+      DERP: (.Relay // ""),
+      IPv4: first_v4(.TailscaleIPs),
+      IPv6: first_v6(.TailscaleIPs),
+      KeyExpiry: (.KeyExpiry // "")
+    };
+
+  (["Peer","Online","Relay","Direct","DERP","IPv4","IPv6","KeyExpiry"] | @tsv),
+  ( .Self | row
+    | [.Peer,(if .Online then "yes" else "no" end),.Relay,
+       (if .Direct then "yes" else "no" end),.DERP,.IPv4,.IPv6,.KeyExpiry] | @tsv ),
+  ( .Peer[]? | row
+    | [.Peer,(if .Online then "yes" else "no" end),.Relay,
+       (if .Direct then "yes" else "no" end),.DERP,.IPv4,.IPv6,.KeyExpiry] | @tsv )
+' | awk -F'\t' '
+  {
+    rows[NR]=$0; if (NF>cols) cols=NF;
+    for (i=1;i<=NF;i++) { l=length($i); if (l>max[i]) max[i]=l }
+  }
+  END {
+    for (r=1;r<=NR;r++) {
+      split(rows[r], f, FS);
+      for (i=1;i<cols;i++) {
+        w = max[i] - length(f[i]) + 1;        # +1 = 列间隔 1 空格
+        if (w < 1) w = 1;
+        pad = sprintf("%" w "s", "");         # 动态宽度，不用 *
+        printf "%s%s", f[i], pad;
+      }
+      print f[cols];                           # 最后一列不填充
+    }
+  }' || $TS status 2>&1
+
+
+echo
+echo_date 检查 Tailscale 相关 iptables 规则是否符合预期
+
+# -------- 参数与环境收集 --------
+VERBOSE=0
+[ "${1:-}" = "--verbose" ] && VERBOSE=1
+
+# 载入 dbus 配置
+eval `dbus export tailscale`
+
+# -------- 缺省变量（POSIX 兼容写法）--------
+# LAN_IF：优先用已存在的环境变量；否则尝试 nvram；再不行回退 br0
+if [ -n "${LAN_IF:-}" ]; then
+  LAN_IF="$LAN_IF"
+else
+  if command -v nvram >/dev/null 2>&1; then
+    LAN_IF="$(nvram get lan_ifname 2>/dev/null || true)"
+    [ -n "$LAN_IF" ] || LAN_IF="br0"
+  else
+    LAN_IF="br0"
+  fi
+fi
+
+tailscale_role="${tailscale_role:-1}"           # 1=网关, 2=终端, 3=混合
+tailscale_SNAT_enable="${tailscale_SNAT_enable:-1}"
+
+# TS_NET4：Tailscale 的 IPv4 段，默认 CGNAT 100.64.0.0/10
+if [ -n "${TAILSCALE_NET4:-}" ]; then
+  TS_NET4="$TAILSCALE_NET4"
+else
+  if [ -n "${TS_NET4:-}" ]; then
+    TS_NET4="$TS_NET4"
+  else
+    TS_NET4="100.64.0.0/10"
+  fi
+fi
+
+# -------- 输出工具函数（尽量简单，兼容 ash）--------
+ok(){   echo "OK  $*"; }
+warn(){ echo "WARN $*"; }
+fail(){ echo "FAIL $*"; }
+
+show_fix(){
+  echo "    修复建议: $*"
+}
+
+have_cmd(){
+  command -v "$1" >/dev/null 2>&1
+}
+
+# path=参数1；want=参数2
+check_sysctl(){
+  path="$1"
+  want="$2"
+  if [ -f "$path" ]; then
+    now="$(cat "$path" 2>/dev/null || echo)"
+    if [ "$now" = "$want" ]; then
+      ok "内核参数 $path = $want"
+    else
+      fail "内核参数 $path = $now（期望 $want）"
+      show_fix "echo $want > $path"
+    fi
+  else
+    warn "内核参数 $path 不存在（可忽略或固件未启用该项）"
+  fi
+}
+
+# 用法：check_rule "描述" CHAIN <match...>   —— 表固定为 filter
+check_rule(){
+  desc="$1"
+  shift
+  chain="$1"
+  shift
+  if iptables -t filter -C "$chain" "$@" 2>/dev/null; then
+    ok "$desc 存在"
+  else
+    fail "$desc 缺失"
+    show_fix "iptables -t filter -I $chain $*"
+  fi
+}
+
+# 用法：check_nat_rule "描述" CHAIN <match...>   —— 表固定为 nat
+check_nat_rule(){
+  desc="$1"
+  shift
+  chain="$1"
+  shift
+  if iptables -t nat -C "$chain" "$@" 2>/dev/null; then
+    ok "$desc 存在"
+  else
+    fail "$desc 缺失"
+    show_fix "iptables -t nat -I $chain $*"
+  fi
+}
+
+# 检查 from_chain 是否已跳转到 target_chain（指定表）
+# 用法: check_jump TABLE FROM_CHAIN TARGET_CHAIN
+check_jump(){
+  tbl="$1"; from="$2"; to="$3"
+  if iptables -t "$tbl" -C "$from" -j "$to" 2>/dev/null; then
+    ok "已从 $tbl/$from 跳转到 $to"
+  else
+    fail "$tbl/$from 未跳转到 $to"
+    show_fix "iptables -t $tbl -A $from -j $to"
+  fi
+}
+
+# 检查自建链里的某条规则（通用）
+# 用法: check_chain_rule_table TABLE CHAIN <match...>
+check_chain_rule_table(){
+  tbl="$1"; shift
+  chain="$1"; shift
+  if iptables -t "$tbl" -C "$chain" "$@" 2>/dev/null; then
+    ok "$tbl/$chain 规则存在: $*"
+  else
+    fail "$tbl/$chain 规则缺失: $*"
+    show_fix "iptables -t $tbl -A $chain $*"
+  fi
+}
+
+# 期望“没有”某条规则（负向检查）
+# 用法: check_absence "描述" TABLE CHAIN <match...>
+check_absence(){
+  desc="$1"; shift
+  tbl="$1"; shift
+  chain="$1"; shift
+  if iptables -t "$tbl" -C "$chain" "$@" 2>/dev/null; then
+    fail "$desc 不应存在（却检测到）"
+    show_fix "iptables -t $tbl -D $chain $*"
+  else
+    ok "$desc 不存在（符合预期）"
+  fi
+}
+
+echo "==[1/3] 检查内核转发与 rp_filter =="
+
+if [ "$tailscale_role" = "2" ]; then
+  # 终端模式：不要求开启转发
+  if [ -f /proc/sys/net/ipv4/ip_forward ]; then
+    cur="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
+    if [ "$cur" = "0" ]; then
+      ok "终端模式：ip_forward=0（符合预期）"
+    else
+      warn "终端模式：检测到 ip_forward=$cur，一般不需要开启"
+      show_fix "echo 0 > /proc/sys/net/ipv4/ip_forward"
+    fi
+  fi
+else
+  # 网关/混合：需要开启转发
+  check_sysctl /proc/sys/net/ipv4/ip_forward 1
+  # rp_filter 仅在 role=1/3 对 v4 有意义
+  if [ -f /proc/sys/net/ipv4/conf/all/rp_filter ]; then
+    check_sysctl /proc/sys/net/ipv4/conf/all/rp_filter 2
+  else
+    warn "缺少 /proc/sys/net/ipv4/conf/all/rp_filter"
+  fi
+  if [ -f "/proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter" ]; then
+    check_sysctl "/proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter" 2
+  else
+    warn "缺少 ${LAN_IF} 的 rp_filter"
+  fi
+  if [ -f /proc/sys/net/ipv4/conf/tailscale0/rp_filter ]; then
+    check_sysctl /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2
+  else
+    warn "缺少 tailscale0 的 rp_filter"
+  fi
+fi
+
+echo
+echo "==[2/3] 检查基础放行（INPUT）与链跳转（FORWARD/POSTROUTING） =="
+
+# 无论什么角色，都应允许 tailscale0 访问本机
+check_rule "允许 tailscale0 访问本机 (INPUT)" INPUT -i tailscale0 -j ACCEPT
+
+if [ "$tailscale_role" = "2" ]; then
+  # 终端模式：不应挂载自建链跳转
+  check_absence "FORWARD -> TSFWD 跳转"     filter FORWARD     -j TSFWD
+  check_absence "POSTROUTING -> TSNAT 跳转" nat    POSTROUTING -j TSNAT
+else
+  # 网关/混合：应挂载自建链跳转
+  check_jump filter FORWARD     TSFWD
+  check_jump nat    POSTROUTING TSNAT
+fi
+
+echo
+echo "==[3/3] 检查角色（role=$tailscale_role）对应链内规则 =="
+
+case "$tailscale_role" in
+  1) # 网关
+     # TSFWD 链（filter）
+     check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+     check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+     check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+
+     # TSNAT 链（nat）
+     if [ "$tailscale_SNAT_enable" = "1" ]; then
+       check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     else
+       check_absence "TSNAT 中 tailnet->LAN 的 MASQUERADE（SNAT 关闭）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     fi
+
+     # 兜底提醒：不建议在 POSTROUTING 直挂 MASQUERADE
+     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     ;;
+  2) # 终端
+     # 不应有转发/NAT（链跳转已在 [2/3] 做负向检查）
+     check_absence "TSFWD 链已建立规则"        filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+     check_absence "TSFWD tailscale0->LAN"     filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+     check_absence "TSFWD LAN->tailscale0"     filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+     check_absence "TSNAT tailnet->LAN SNAT"   nat    TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     check_absence "TSNAT 出 tailscale0 SNAT"  nat    TSNAT -o tailscale0 -j MASQUERADE
+     ;;
+  3) # 混合
+     # TSFWD
+     check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+     check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+     check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+
+     # TSNAT
+     if [ "$tailscale_SNAT_enable" = "1" ]; then
+       check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     else
+       check_absence "TSNAT 中 tailnet->LAN 的 MASQUERADE（SNAT 关闭）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     fi
+     # 额外：LAN 借道 tailscale0 出口（混合模式必须有）
+     check_chain_rule_table nat TSNAT -o tailscale0 -j MASQUERADE
+
+     # 兜底提醒
+     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     ;;
+  *)
+     warn "未知 tailscale_role=$tailscale_role，按网关模式检查"
+     check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+     check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+     check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+     if [ "$tailscale_SNAT_enable" = "1" ]; then
+       check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     fi
+     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+     ;;
+esac
+
+if [ "$VERBOSE" -eq 1 ]; then
+  echo
+  echo "== 现有规则快照（filter/nat） =="
+  iptables -S || true
+  echo
+  iptables -t nat -S || true
+fi
+
+echo
+ok "检查完成（role=$tailscale_role, SNAT=$tailscale_SNAT_enable, LAN_IF=${LAN_IF}, TS_NET4=${TS_NET4})"
+echo "XU6J03M6"
