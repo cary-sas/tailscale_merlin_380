@@ -11,7 +11,6 @@
   <link rel="stylesheet" type="text/css" href="index_style.css"/>
   <link rel="stylesheet" type="text/css" href="form_style.css"/>
   <link rel="stylesheet" type="text/css" href="css/element.css"/>
-  <link rel="stylesheet" type="text/css" href="/res/shadowsocks.css">
   <script type="text/javascript" src="/state.js"></script>  
   <script type="text/javascript" src="/popup.js"></script>
   <script type="text/javascript" src="/help.js"></script>
@@ -618,7 +617,7 @@ function ts_check_update(){
     <input type="hidden" id="tailscale_role" name="tailscale_role" value='<% dbus_get_def("tailscale_role",""); %>'/>
     <input type="hidden" id="tailscale_ipv4_enable" name="tailscale_ipv4_enable" value='<% dbus_get_def("tailscale_ipv4_enable","1"); %>'/>
     <input type="hidden" id="tailscale_ipv6_enable" name="tailscale_ipv6_enable" value='<% dbus_get_def("tailscale_ipv6_enable","1"); %>'/>
-    <input type="hidden" id="tailscale_accept_routes" name="tailscale_accept_routes" value='<% dbus_get_def("tailscale_accept_routes","1"); %>'/>
+    <!-- <input type="hidden" id="tailscale_accept_routes" name="tailscale_accept_routes" value='<% dbus_get_def("tailscale_accept_routes","1"); %>'/> -->
   	<input type="hidden" id="tailscale_SNAT_enable" name="tailscale_SNAT_enable" value='<% dbus_get_def("tailscale_SNAT_enable","1"); %>'/>
     <input type="hidden" id="tailscale_advertise_exit" name="tailscale_advertise_exit" value='<% dbus_get_def("tailscale_advertise_exit","0"); %>'/>
 

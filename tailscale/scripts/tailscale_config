@@ -281,6 +281,7 @@ apply_ts() {
 cmd="$1"
 if [ -z "$cmd" ]; then
   apply_ts
+  echo "XU6J03M6"
   exit $?
 fi
 
@@ -291,5 +292,5 @@ case "$cmd" in
   status)  status_ts ;;
   *)       apply_ts ;;
 esac
-
+echo "XU6J03M6"
 exit 0

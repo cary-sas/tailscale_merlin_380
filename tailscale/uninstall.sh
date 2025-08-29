@@ -13,6 +13,7 @@ fi
 # 删除文件
 rm -f  /koolshare/bin/tailscale
 rm -f  /koolshare/bin/tailscaled
+rm -f  /koolshare/bin/tailscale.combined
 rm -f  /koolshare/webs/Module_tailscale.asp
 rm -f  /koolshare/res/*tailscale* 2>/dev/null
 rm -f  /koolshare/init.d/*tailscale*.sh 2>/dev/null

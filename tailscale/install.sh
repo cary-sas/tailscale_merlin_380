@@ -23,15 +23,15 @@ if [ "$tailscale_enable" == "1" ];then
 	sh /koolshare/scripts/tailscale_config stop
 fi
 
-	# remove before install
-  rm -f "/var/run/tailscale/tailscaled.sock" >/dev/null 2>&1
-  rm -f "/var/run/tailscale/tailscaled.pid" >/dev/null 2>&1
-	rm -f /koolshare/bin/tailscale* >/dev/null 2>&1
-	rm -f /koolshare/res/icon-tailscale.png >/dev/null 2>&1
-	rm -f /koolshare/scripts/tailscale_* >/dev/null 2>&1
-	rm -f /koolshare/webs/Module_tailscale.asp >/dev/null 2>&1
-	find /koolshare/init.d -name "*tailscale*" | xargs rm -f
-  rm -f /tmp/tailscale_*.log >/dev/null 2>&1
+# remove before install
+rm -f "/var/run/tailscale/tailscaled.sock" >/dev/null 2>&1
+rm -f "/var/run/tailscale/tailscaled.pid" >/dev/null 2>&1
+rm -f /koolshare/bin/tailscale* >/dev/null 2>&1
+rm -f /koolshare/res/icon-tailscale.png >/dev/null 2>&1
+rm -f /koolshare/scripts/tailscale_* >/dev/null 2>&1
+rm -f /koolshare/webs/Module_tailscale.asp >/dev/null 2>&1
+find /koolshare/init.d -name "*tailscale*" | xargs rm -f
+rm -f /tmp/tailscale_*.log >/dev/null 2>&1
 
 # 解压安装包
 echo_date "解压安装包..."
@@ -42,8 +42,6 @@ if [ "$?" != "0" ]; then
   exit 1
 fi			
 
-# 解包目录固定在 /tmp/tailscale
-cd /tmp
 
 # 1) 拷贝到 koolshare 标准位置
 cp -rf /tmp/tailscale/bin/*        /koolshare/bin/
@@ -54,20 +52,21 @@ cp -rf /tmp/tailscale/res/*        /koolshare/res/
 
 
 # 2) 清理临时
-cd /
 rm -rf /tmp/tailscale* >/dev/null 2>&1
 
 # 3) 权限
-chmod 755 /koolshare/bin/tailscale        2>/dev/null
-chmod 755 /koolshare/bin/tailscaled       2>/dev/null
+chmod 755 /koolshare/bin/tailscale.combined  2>/dev/null
 chmod 755 /koolshare/bin/jq               2>/dev/null
 chmod 755 /koolshare/scripts/tailscale_*  2>/dev/null
 chmod 755 /koolshare/init.d/*tailscale*.sh 2>/dev/null
 
+ln -sf /koolshare/bin/tailscale.combined /koolshare/bin/tailscale  2>/dev/null
+ln -sf /koolshare/bin/tailscale.combined /koolshare/bin/tailscaled 2>/dev/null
+
 # 离线安装时设置软件中心内储存的版本号和连接
 
-dbus set tailscale_version="1.0.0"
-dbus set softcenter_module_tailscale_version="1.0.0"
+dbus set tailscale_version="1.0.1"
+dbus set softcenter_module_tailscale_version="1.0.1"
 dbus set softcenter_module_tailscale_install="4"
 dbus set softcenter_module_tailscale_name="tailscale"
 dbus set softcenter_module_tailscale_title="Tailscale"

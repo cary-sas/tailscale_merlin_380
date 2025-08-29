@@ -11,4 +11,4 @@ if [ ! -x "$TS" ]; then
 fi
 
 "$TS" netcheck 2>&1
-
+echo "XU6J03M6"

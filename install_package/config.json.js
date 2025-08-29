@@ -1,9 +1,9 @@
 {
-  "build_date":"2025-08-29_10:56:37",
+  "build_date":"2025-08-29_17:42:46",
   "description":"基于wireguard协议的零配置内网穿透安全组网工具",
   "home_url":"Module_tailscale.asp",
-  "md5":"b7de46a40fe97e0e2f9552effceb0cc3",
+  "md5":"f8897594cfebf89a759ca4ba18d6c4ee",
   "name":"tailscale",
-  "tar_url":"https://github.com/cary-sas/tailscale_merlin_380/install_package/1.0.0/tailscale.tar.gz",
-  "version":"1.0.0"
+  "tar_url":"https://github.com/cary-sas/tailscale_merlin_380/install_package/1.0.1/tailscale.tar.gz",
+  "version":"1.0.1"
 }
