@@ -77,6 +77,17 @@ function buildswitches() {
     document.form.tailscale_role.value = v;        // **写回 hidden**
     updateRoleUI();
   });
+
+  // 私有化: checkbox -> hidden；文本框 -> hidden
+  $("#cb_private_enable").on("click", function(){
+    document.form.tailscale_private_enable.value = this.checked ? 1 : 0;
+    // 启用/禁用输入框
+    E("input_login_server").disabled = !this.checked;
+  });
+  $("#input_login_server").on("input", function(){
+    document.form.tailscale_login_server.value = (this.value || "").trim();
+  });
+
 }
 
 function conf2obj() {
@@ -100,6 +111,18 @@ function conf2obj() {
   var ex = (d["tailscale_advertise_exit"] || "0") == "1";
   E("cb_adv_exit").checked = ex;
   document.form.tailscale_advertise_exit.value = ex ? 1 : 0;
+
+  // 私有化（Headscale）
+  var pvt = (d["tailscale_private_enable"] || "0") == "1";
+  var lsu = (d["tailscale_login_server"] || "").trim();
+
+  E("cb_private_enable").checked = pvt;
+  document.form.tailscale_private_enable.value = pvt ? 1 : 0;
+
+  E("input_login_server").value = lsu;
+  document.form.tailscale_login_server.value = lsu;
+  E("input_login_server").disabled = !pvt;
+
 
 // Auth Key：只从 dbus 拿值，避免依赖 input 缓存
   var akInput = E("tailscale_authkey");
@@ -388,7 +411,9 @@ function onSubmitCtrl(btn, s){
     tailscale_advertise_exit:   document.form.tailscale_advertise_exit.value,
 	  tailscale_role:            (document.form.tailscale_role && document.form.tailscale_role.value) ? document.form.tailscale_role.value : "",
 	  tailscale_SNAT_enable:      document.form.tailscale_SNAT_enable.value,
-    tailscale_advertise_routes: E("tailscale_advertise_routes").value || ""
+    tailscale_advertise_routes: E("tailscale_advertise_routes").value || "",
+    tailscale_private_enable:   document.form.tailscale_private_enable.value,
+    tailscale_login_server:     document.form.tailscale_login_server.value
   };
 
  // 关键：只有输入非空时才覆盖原有 authkey
@@ -406,6 +431,14 @@ function onSubmitCtrl(btn, s){
     ? '<li><font color="#ffcc00">请等待日志显示完毕，并出现自动关闭按钮！</font></li>'
       + '<li><font color="#ffcc00">此期间请不要刷新本页面！</font></li>'
     : '<li><font color="#ffcc00">请勿刷新本页面，执行中 ...</font></li>';
+
+    if (payload.tailscale_private_enable == "1") {
+      var url = (payload.tailscale_login_server || "").trim();
+      if (!url) {
+        alert("已勾选“私有化部署”，但未填写控制平面 URL（--login-server）。");
+        return false;
+      }
+    }
 
   showSSLoadingBar(titleHTML, tipsHTML);
 
@@ -620,6 +653,8 @@ function ts_check_update(){
     <!-- <input type="hidden" id="tailscale_accept_routes" name="tailscale_accept_routes" value='<% dbus_get_def("tailscale_accept_routes","1"); %>'/> -->
   	<input type="hidden" id="tailscale_SNAT_enable" name="tailscale_SNAT_enable" value='<% dbus_get_def("tailscale_SNAT_enable","1"); %>'/>
     <input type="hidden" id="tailscale_advertise_exit" name="tailscale_advertise_exit" value='<% dbus_get_def("tailscale_advertise_exit","0"); %>'/>
+    <input type="hidden" id="tailscale_private_enable" name="tailscale_private_enable" value='<% dbus_get_def("tailscale_private_enable","0"); %>'/>
+    <input type="hidden" id="tailscale_login_server"  name="tailscale_login_server"  value='<% dbus_get_def("tailscale_login_server",""); %>'/>
 
     <table class="content" align="center" cellpadding="0" cellspacing="0">
       <tr>
@@ -738,6 +773,18 @@ function ts_check_update(){
                             <label><input type="checkbox" id="cb_adv_exit"/> 将本机设为 Exit Node</label>
                           </td>
                         </tr>
+                        <tr>
+                          <th>私有化部署（Headscale）</th>
+                          <td>
+                            <label style="margin-right:1em;">
+                              <input type="checkbox" id="cb_private_enable"/>
+                              启用私有化控制平面
+                            </label>
+                            <input type="text" id="input_login_server" class="input_ss_table" style="width:320px;"
+                                  placeholder="例如：https://headscale.example.com"/>
+                            <span class="hintstyle" style="margin-left:.5em;">用于 <code>--login-server</code></span>
+                          </td>
+                      </tr>
                       </table>
 
                       <div class="apply_gen" style="margin-top:10px;">

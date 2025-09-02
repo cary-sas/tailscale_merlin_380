@@ -39,7 +39,8 @@ dbus remove tailscale_SNAT_enable
 dbus remove tailscale_advertise_exit
 dbus remove tailscale_advertise_routes
 dbus remove tailscale_authkey
-    
+dbus remove tailscale_private_enable
+dbus remove tailscale_login_server    
 
 echo_date "tailscale插件卸载成功！"
 echo_date "-------------------------------------------"

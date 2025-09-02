@@ -81,6 +81,9 @@ get_conf() {
 
   tailscale_SNAT_enable="$(dbus get tailscale_SNAT_enable)"; # 0=off, 1=on（仅对 server/both 的 tailscale0->LAN 生效）
   [ -z "${tailscale_SNAT_enable}" ] && tailscale_SNAT_enable=0
+
+  tailscale_private_enable="$(dbus get tailscale_private_enable)"; [ -z "$tailscale_private_enable" ] && tailscale_private_enable=0
+  tailscale_login_server="$(dbus get tailscale_login_server)"
 }
 
 # ---------- 组装 tailscale up 参数（accept-routes 由 role 推导） ----------
@@ -102,6 +105,12 @@ build_up_flags() {
 
   # 出口节点（按 UI）
   [ "$tailscale_advertise_exit" = "1" ] && UP_FLAGS="$UP_FLAGS --advertise-exit-node"
+
+
+  # 私有化控制平面
+  if [ "$tailscale_private_enable" = "1" ] && [ -n "$tailscale_login_server" ]; then
+    UP_FLAGS="$UP_FLAGS --login-server=${tailscale_login_server}"
+  fi
 
   echo "$UP_FLAGS"
 }
