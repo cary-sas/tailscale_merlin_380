@@ -65,8 +65,8 @@ ln -sf /koolshare/bin/tailscale.combined /koolshare/bin/tailscaled 2>/dev/null
 
 # 离线安装时设置软件中心内储存的版本号和连接
 
-dbus set tailscale_version="1.0.2"
-dbus set softcenter_module_tailscale_version="1.0.2"
+dbus set tailscale_version="1.0.3"
+dbus set softcenter_module_tailscale_version="1.0.3"
 dbus set softcenter_module_tailscale_install="4"
 dbus set softcenter_module_tailscale_name="tailscale"
 dbus set softcenter_module_tailscale_title="Tailscale"

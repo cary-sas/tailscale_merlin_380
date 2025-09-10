@@ -81,6 +81,9 @@ VERBOSE=0
 # 载入 dbus 配置
 eval `dbus export tailscale`
 
+tailscale_ipv4_enable="${tailscale_ipv4_enable:-0}"
+tailscale_ipv6_enable="${tailscale_ipv6_enable:-0}"
+
 # -------- 缺省变量（POSIX 兼容写法）--------
 # LAN_IF：优先用已存在的环境变量；否则尝试 nvram；再不行回退 br0
 if [ -n "${LAN_IF:-}" ]; then
@@ -166,6 +169,31 @@ check_nat_rule(){
   fi
 }
 
+
+# ---- IPv6 版的存在/不存在检查（仅用于 INPUT 放行）----
+check_rule6(){
+  desc="$1"; shift
+  chain="$1"; shift
+  if ip6tables -t filter -C "$chain" "$@" 2>/dev/null; then
+    ok "$desc 存在"
+  else
+    fail "$desc 缺失"
+    show_fix "ip6tables -t filter -I $chain $*"
+  fi
+}
+
+check_absence6(){
+  desc="$1"; shift
+  tbl="$1"; shift
+  chain="$1"; shift
+  if ip6tables -t "$tbl" -C "$chain" "$@" 2>/dev/null; then
+    fail "$desc 不应存在（却检测到）"
+    show_fix "ip6tables -t $tbl -D $chain $*"
+  else
+    ok "$desc 不存在（符合预期）"
+  fi
+}
+
 # 检查 from_chain 是否已跳转到 target_chain（指定表）
 # 用法: check_jump TABLE FROM_CHAIN TARGET_CHAIN
 check_jump(){
@@ -242,76 +270,113 @@ fi
 echo
 echo "==[2/3] 检查基础放行（INPUT）与链跳转（FORWARD/POSTROUTING） =="
 
-# 无论什么角色，都应允许 tailscale0 访问本机
-check_rule "允许 tailscale0 访问本机 (INPUT)" INPUT -i tailscale0 -j ACCEPT
+# ---- IPv4（受 tailscale_ipv4_enable 控制）----
+if [ "$tailscale_ipv4_enable" = "1" ]; then
+  # 无论什么角色，都应允许 tailscale0 访问本机（IPv4）
+  check_rule "允许 tailscale0 访问本机 (INPUT, IPv4)" INPUT -i tailscale0 -j ACCEPT
 
-if [ "$tailscale_role" = "2" ]; then
-  # 终端模式：不应挂载自建链跳转
-  check_absence "FORWARD -> TSFWD 跳转"     filter FORWARD     -j TSFWD
-  check_absence "POSTROUTING -> TSNAT 跳转" nat    POSTROUTING -j TSNAT
+  # FORWARD -> TSFWD 跳转（仅当 role=1/3 需要；role=2 不应存在）
+  if [ "$tailscale_role" = "2" ]; then
+    check_absence "FORWARD -> TSFWD 跳转" filter FORWARD -j TSFWD
+  else
+    check_jump    filter FORWARD TSFWD
+  fi
 else
-  # 网关/混合：应挂载自建链跳转
-  check_jump filter FORWARD     TSFWD
-  check_jump nat    POSTROUTING TSNAT
+  # IPv4 关闭时：不应存在 v4 INPUT 放行与 FORWARD 跳转
+  check_absence "（IPv4关闭）INPUT 放行"         filter INPUT   -i tailscale0 -j ACCEPT
+  check_absence "（IPv4关闭）FORWARD -> TSFWD"   filter FORWARD -j TSFWD
 fi
+
+# ---- TSNAT（IPv4 NAT）：与 ipv4_enable 无关，受 role/SNAT 控制 ----
+if [ "$tailscale_role" = "3" ] || { [ "$tailscale_role" = "1" ] && [ "$tailscale_SNAT_enable" = "1" ]; }; then
+  # 混合模式始终有，或 网关+SNAT=1：应挂 POSTROUTING -> TSNAT
+  check_jump nat POSTROUTING TSNAT
+else
+  # 终端模式 或 网关+SNAT=0：不应挂
+  check_absence "POSTROUTING -> TSNAT 跳转" nat POSTROUTING -j TSNAT
+fi
+
+
+# ---- IPv6（仅 INPUT 放行；无转发/NAT）----
+if [ "$tailscale_ipv6_enable" = "1" ]; then
+  check_rule6 "允许 tailscale0 访问本机 (INPUT, IPv6)" INPUT -i tailscale0 -j ACCEPT
+else
+  check_absence6 "（IPv6关闭）INPUT 放行 (IPv6)" filter INPUT -i tailscale0 -j ACCEPT
+fi
+
 
 echo
 echo "==[3/3] 检查角色（role=$tailscale_role）对应链内规则 =="
 
 case "$tailscale_role" in
   1) # 网关
-     # TSFWD 链（filter）
-     check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
-     check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
-     check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+    # ---- TSFWD（只在 IPv4 开启时检查）----
+    if [ "$tailscale_ipv4_enable" = "1" ]; then
+      check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+      check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+      check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+    else
+      warn "IPv4 功能关闭：跳过 TSFWD 规则细节检查"
+    fi
 
-     # TSNAT 链（nat）
-     if [ "$tailscale_SNAT_enable" = "1" ]; then
-       check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     else
-       check_absence "TSNAT 中 tailnet->LAN 的 MASQUERADE（SNAT 关闭）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     fi
+    # ---- TSNAT（与 ipv4_enable 无关）----
+    if [ "$tailscale_SNAT_enable" = "1" ]; then
+      check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    else
+      check_absence "TSNAT 中 tailnet->LAN 的 MASQUERADE（SNAT 关闭）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    fi
+    check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    ;;
 
-     # 兜底提醒：不建议在 POSTROUTING 直挂 MASQUERADE
-     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     ;;
   2) # 终端
-     # 不应有转发/NAT（链跳转已在 [2/3] 做负向检查）
-     check_absence "TSFWD 链已建立规则"        filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
-     check_absence "TSFWD tailscale0->LAN"     filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
-     check_absence "TSFWD LAN->tailscale0"     filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
-     check_absence "TSNAT tailnet->LAN SNAT"   nat    TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     check_absence "TSNAT 出 tailscale0 SNAT"  nat    TSNAT -o tailscale0 -j MASQUERADE
-     ;;
+    # ---- TSFWD（仅在 IPv4 开启时检查负向）----
+    if [ "$tailscale_ipv4_enable" = "1" ]; then
+      check_absence "TSFWD 链已建立规则"        filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+      check_absence "TSFWD tailscale0->LAN"     filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+      check_absence "TSFWD LAN->tailscale0"     filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+    fi
+    # ---- TSNAT：终端模式不应存在（与 ipv4_enable 无关）----
+    check_absence "TSNAT tailnet->LAN SNAT"   nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    check_absence "TSNAT 出 tailscale0 SNAT"  nat TSNAT -o tailscale0 -j MASQUERADE
+    ;;
+
   3) # 混合
-     # TSFWD
-     check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
-     check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
-     check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+    # ---- TSFWD（只在 IPv4 开启时检查）----
+    if [ "$tailscale_ipv4_enable" = "1" ]; then
+      check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+      check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+      check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+    else
+      warn "IPv4 功能关闭：跳过 TSFWD 规则细节检查"
+    fi
+    # ---- TSNAT（与 ipv4_enable 无关）----
+    if [ "$tailscale_SNAT_enable" = "1" ]; then
+      check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    else
+      check_absence "TSNAT 中 tailnet->LAN 的 MASQUERADE（SNAT 关闭）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    fi
+    # 混合模式额外：LAN 借道 tailscale0 出去
+    check_chain_rule_table nat TSNAT -o tailscale0 -j MASQUERADE
 
-     # TSNAT
-     if [ "$tailscale_SNAT_enable" = "1" ]; then
-       check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     else
-       check_absence "TSNAT 中 tailnet->LAN 的 MASQUERADE（SNAT 关闭）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     fi
-     # 额外：LAN 借道 tailscale0 出口（混合模式必须有）
-     check_chain_rule_table nat TSNAT -o tailscale0 -j MASQUERADE
+    check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    ;;
 
-     # 兜底提醒
-     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     ;;
   *)
-     warn "未知 tailscale_role=$tailscale_role，按网关模式检查"
-     check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
-     check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
-     check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
-     if [ "$tailscale_SNAT_enable" = "1" ]; then
-       check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     fi
-     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-     ;;
+    warn "未知 tailscale_role=$tailscale_role，按网关模式检查"
+    if [ "$tailscale_ipv4_enable" = "1" ]; then
+      check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+      check_chain_rule_table filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+      check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+    else
+      warn "IPv4 功能关闭：跳过 TSFWD 规则细节检查"
+    fi
+    if [ "$tailscale_SNAT_enable" = "1" ]; then
+      check_chain_rule_table nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    fi
+    check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
+    ;;
 esac
+
 
 if [ "$VERBOSE" -eq 1 ]; then
   echo
@@ -319,6 +384,8 @@ if [ "$VERBOSE" -eq 1 ]; then
   iptables -S || true
   echo
   iptables -t nat -S || true
+  echo "== 现有 IPv6 INPUT 规则快照 =="
+  ip6tables -S INPUT 2>/dev/null || true
 fi
 
 echo
