@@ -254,6 +254,8 @@ start_ts() {
 
   if ! pidof tailscaled >/dev/null 2>&1; then
     echo_date "启动 tailscaled ..."
+	GOGC=20 GOMEMLIMIT=64MiB \
+	TS_DEBUG_MEMORY=1 TS_LOG_TARGET=stderr \
     "${TSD}" --state="${STATE}" --statedir="${STATE_DIR}" --socket="${SOCK}" --port=41641 > "${TSDLOG}" 2>&1 &
     sleep 2
   else
