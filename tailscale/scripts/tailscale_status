@@ -235,37 +235,25 @@ check_absence(){
 
 echo "==[1/3] 检查内核转发与 rp_filter =="
 
-if [ "$tailscale_role" = "2" ]; then
-  # 终端模式：不要求开启转发
-  if [ -f /proc/sys/net/ipv4/ip_forward ]; then
-    cur="$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)"
-    if [ "$cur" = "0" ]; then
-      ok "终端模式：ip_forward=0（符合预期）"
-    else
-      warn "终端模式：检测到 ip_forward=$cur，一般不需要开启"
-      show_fix "echo 0 > /proc/sys/net/ipv4/ip_forward"
-    fi
-  fi
+# 新语义：role=2 也是“LAN 可出站”的终端，必须开 v4 转发并放宽 rp_filter
+check_sysctl /proc/sys/net/ipv4/ip_forward 1
+
+if [ -f /proc/sys/net/ipv4/conf/all/rp_filter ]; then
+  check_sysctl /proc/sys/net/ipv4/conf/all/rp_filter 2
 else
-  # 网关/混合：需要开启转发
-  check_sysctl /proc/sys/net/ipv4/ip_forward 1
-  # rp_filter 仅在 role=1/3 对 v4 有意义
-  if [ -f /proc/sys/net/ipv4/conf/all/rp_filter ]; then
-    check_sysctl /proc/sys/net/ipv4/conf/all/rp_filter 2
-  else
-    warn "缺少 /proc/sys/net/ipv4/conf/all/rp_filter"
-  fi
-  if [ -f "/proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter" ]; then
-    check_sysctl "/proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter" 2
-  else
-    warn "缺少 ${LAN_IF} 的 rp_filter"
-  fi
-  if [ -f /proc/sys/net/ipv4/conf/tailscale0/rp_filter ]; then
-    check_sysctl /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2
-  else
-    warn "缺少 tailscale0 的 rp_filter"
-  fi
+  warn "缺少 /proc/sys/net/ipv4/conf/all/rp_filter"
 fi
+if [ -f "/proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter" ]; then
+  check_sysctl "/proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter" 2
+else
+  warn "缺少 ${LAN_IF} 的 rp_filter"
+fi
+if [ -f /proc/sys/net/ipv4/conf/tailscale0/rp_filter ]; then
+  check_sysctl /proc/sys/net/ipv4/conf/tailscale0/rp_filter 2
+else
+  warn "缺少 tailscale0 的 rp_filter"
+fi
+
 
 echo
 echo "==[2/3] 检查基础放行（INPUT）与链跳转（FORWARD/POSTROUTING） =="
@@ -275,26 +263,21 @@ if [ "$tailscale_ipv4_enable" = "1" ]; then
   # 无论什么角色，都应允许 tailscale0 访问本机（IPv4）
   check_rule "允许 tailscale0 访问本机 (INPUT, IPv4)" INPUT -i tailscale0 -j ACCEPT
 
-  # FORWARD -> TSFWD 跳转（仅当 role=1/3 需要；role=2 不应存在）
-  if [ "$tailscale_role" = "2" ]; then
-    check_absence "FORWARD -> TSFWD 跳转" filter FORWARD -j TSFWD
-  else
-    check_jump    filter FORWARD TSFWD
-  fi
+  # FORWARD -> TSFWD 跳转（role=1/2/3 都需要；IPv4 开启时才检查）
+  check_jump filter FORWARD TSFWD
 else
   # IPv4 关闭时：不应存在 v4 INPUT 放行与 FORWARD 跳转
   check_absence "（IPv4关闭）INPUT 放行"         filter INPUT   -i tailscale0 -j ACCEPT
   check_absence "（IPv4关闭）FORWARD -> TSFWD"   filter FORWARD -j TSFWD
 fi
 
-# ---- TSNAT（IPv4 NAT）：与 ipv4_enable 无关，受 role/SNAT 控制 ----
-if [ "$tailscale_role" = "3" ] || { [ "$tailscale_role" = "1" ] && [ "$tailscale_SNAT_enable" = "1" ]; }; then
-  # 混合模式始终有，或 网关+SNAT=1：应挂 POSTROUTING -> TSNAT
+# role=2/3 固定需要；role=1 仅在 SNAT=1 时需要
+if [ "$tailscale_role" = "2" ] || [ "$tailscale_role" = "3" ] || { [ "$tailscale_role" = "1" ] && [ "$tailscale_SNAT_enable" = "1" ]; }; then
   check_jump nat POSTROUTING TSNAT
 else
-  # 终端模式 或 网关+SNAT=0：不应挂
   check_absence "POSTROUTING -> TSNAT 跳转" nat POSTROUTING -j TSNAT
 fi
+
 
 
 # ---- IPv6（仅 INPUT 放行；无转发/NAT）----
@@ -328,16 +311,20 @@ case "$tailscale_role" in
     check_absence "POSTROUTING 直挂 MASQUERADE（应放 TSNAT 链）" nat POSTROUTING -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
     ;;
 
-  2) # 终端
-    # ---- TSFWD（仅在 IPv4 开启时检查负向）----
+  2) # 终端（单向出口网关：LAN -> tailscale0 允许；tailscale0 -> LAN 禁止）
     if [ "$tailscale_ipv4_enable" = "1" ]; then
-      check_absence "TSFWD 链已建立规则"        filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
-      check_absence "TSFWD tailscale0->LAN"     filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
-      check_absence "TSFWD LAN->tailscale0"     filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+      # TSFWD 里应有：回程放行 + LAN->tailscale0 允许
+      check_chain_rule_table filter TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+      check_chain_rule_table filter TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+      # 不应有：tailscale0->LAN
+      check_absence "TSFWD tailscale0->LAN" filter TSFWD -i tailscale0 -o ${LAN_IF} -j ACCEPT
+    else
+      warn "IPv4 功能关闭：跳过 TSFWD 规则细节检查"
     fi
-    # ---- TSNAT：终端模式不应存在（与 ipv4_enable 无关）----
-    check_absence "TSNAT tailnet->LAN SNAT"   nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
-    check_absence "TSNAT 出 tailscale0 SNAT"  nat TSNAT -o tailscale0 -j MASQUERADE
+
+    # TSNAT：role=2 应存在出 tailscale0 的 MASQUERADE；不应存在 tailnet->LAN 的 SNAT
+    check_chain_rule_table nat TSNAT -o tailscale0 -j MASQUERADE
+    check_absence "TSNAT tailnet->LAN SNAT（仅 role=1/3 才需要）" nat TSNAT -s "$TS_NET4" -o ${LAN_IF} -j MASQUERADE
     ;;
 
   3) # 混合
