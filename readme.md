@@ -1,9 +1,9 @@
 
-# Tailscale for Koolshare Merlin 380 ARM
+# Tailscale - 华硕路由器插件 - 适配 Koolshare Merlin 380固件
 
 ## 简介
 
-本项目为 Koolshare 改版梅林固件（380系列）设备提供了 Tailscale 的离线安装包。Tailscale 是一款基于 WireGuard® 协议的零配置内网穿透和安全组网工具，能够让您的设备轻松、安全地互联，无需复杂的网络配置。
+本项目为 Koolshare 改版梅林固件（380系列）路由器提供了 Tailscale 的离线安装包。Tailscale 是一款基于 WireGuard® 协议的零配置内网穿透和安全组网工具，能够让您的设备轻松、安全地互联，无需复杂的网络配置。
 
 Tailscale 主要特性和优势：
 

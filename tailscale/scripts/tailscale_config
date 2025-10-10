@@ -90,7 +90,7 @@ get_conf() {
 # ---------- 组装 tailscale up 参数（accept-routes 由 role 推导） ----------
 build_up_flags() {
   # 我们自己管防火墙
-  if [ "$tailscale_role" = "2" ]; then
+  if [ "$tailscale_role" = "1" ]; then
     UP_FLAGS="--accept-dns=false --netfilter-mode=nodivert --accept-routes=false"
   else
     UP_FLAGS="--accept-dns=false --netfilter-mode=nodivert --accept-routes=true"
@@ -111,7 +111,6 @@ build_up_flags() {
   # 出口节点（按 UI）
   [ "$tailscale_advertise_exit" = "1" ] && UP_FLAGS="$UP_FLAGS --advertise-exit-node"
 
-
   # 私有化控制平面
   if [ "$tailscale_private_enable" = "1" ] && [ -n "$tailscale_login_server" ]; then
     UP_FLAGS="$UP_FLAGS --login-server=${tailscale_login_server}"
@@ -130,36 +129,25 @@ TS_NET4="${TAILSCALE_NET4:-100.64.0.0/10}"   # 如需自定义，可在环境或
 
 # ---- 仅 IPv4 NAT（与 tailscale_ipv4_enable 无关）----
 enable_nat_v4() {
-  # 只有 role=1/3 才有 NAT 语义；role=2 直接返回
-  case "$tailscale_role" in
-    1|3)
-      # 建 TSNAT 链与 POSTROUTING 跳转（幂等）
-      iptables -t nat -N TSNAT 2>/dev/null
-      iptables -t nat -C POSTROUTING -j TSNAT 2>/dev/null || iptables -t nat -A POSTROUTING -j TSNAT
+  # ---- 1. 建立 TSNAT 链与 POSTROUTING 跳转（幂等） ----
+  iptables -t nat -N TSNAT 2>/dev/null
+  iptables -t nat -C POSTROUTING -j TSNAT 2>/dev/null || iptables -t nat -A POSTROUTING -j TSNAT
 
-      # tailnet -> LAN 的 SNAT（受开关控制）
-      if [ "${tailscale_SNAT_enable}" = "1" ]; then
-        iptables -t nat -C TSNAT -s "${TS_NET4}" -o ${LAN_IF} -j MASQUERADE 2>/dev/null \
-          || iptables -t nat -A TSNAT -s "${TS_NET4}" -o ${LAN_IF} -j MASQUERADE
-      else
-        iptables -t nat -D TSNAT -s "${TS_NET4}" -o ${LAN_IF} -j MASQUERADE 2>/dev/null
-      fi
+  # ---- 2. 网关方向：tailnet -> LAN SNAT（仅 role=1/3 且 UI开关=1） ----
+  if [ "$tailscale_SNAT_enable" = "1" ] && { [ "$tailscale_role" = "1" ] || [ "$tailscale_role" = "3" ]; }; then
+    iptables -t nat -C TSNAT -s "${TS_NET4}" -o "${LAN_IF}" -j MASQUERADE 2>/dev/null || iptables -t nat -A TSNAT -s "${TS_NET4}" -o "${LAN_IF}" -j MASQUERADE
+  else
+    iptables -t nat -D TSNAT -s "${TS_NET4}" -o "${LAN_IF}" -j MASQUERADE 2>/dev/null
+  fi
 
-      # 混合模式：LAN 借道 tailscale0 出去
-      if [ "$tailscale_role" = "3" ]; then
-        iptables -t nat -C TSNAT -o tailscale0 -j MASQUERADE 2>/dev/null \
-          || iptables -t nat -A TSNAT -o tailscale0 -j MASQUERADE
-      else
-        iptables -t nat -D TSNAT -o tailscale0 -j MASQUERADE 2>/dev/null
-      fi
-      ;;
-    2) # 终端：不应存在 TSNAT 跳转/规则
-      iptables -t nat -D POSTROUTING -j TSNAT 2>/dev/null
-      iptables -t nat -F TSNAT 2>/dev/null
-      iptables -t nat -X TSNAT 2>/dev/null
-      ;;
-  esac
+  # ---- 3. 出口方向：LAN -> tailnet MASQUERADE（role=2/3 固定开启） ----
+  if [ "$tailscale_role" = "2" ] || [ "$tailscale_role" = "3" ]; then
+    iptables -t nat -C TSNAT -o tailscale0 -j MASQUERADE 2>/dev/null || iptables -t nat -A TSNAT -o tailscale0 -j MASQUERADE
+  else
+    iptables -t nat -D TSNAT -o tailscale0 -j MASQUERADE 2>/dev/null
+  fi
 }
+
 
 disable_nat_v4() {
   # 移除 POSTROUTING 跳转及 TSNAT 链（幂等）
@@ -175,18 +163,32 @@ disable_nat_v4() {
 }
 
 enable_forwarding_v4() {
+  # 先放基础：允许 tailscale0 访问本机 + 放宽 rp_filter（避免回包被丢）
+  iptables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i tailscale0 -j ACCEPT
+  [ -f /proc/sys/net/ipv4/conf/all/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+  [ -f /proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter ]  && echo 2 > /proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter
+  [ -f /proc/sys/net/ipv4/conf/tailscale0/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter
+
+  # 若未启用 IPv4 转发功能，则只做上面的基础放行
   [ "$tailscale_ipv4_enable" = "1" ] || return 0
 
-  # 允许 tailscale0 访问本机（v4）
-  iptables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null || iptables -I INPUT 1 -i tailscale0 -j ACCEPT
-
   case "$tailscale_role" in
-    2) return 0 ;;
-    1|3)
+    2)
+      # role=2：单向出口网关（LAN 可访问 tailnet，但 tailnet 不可入 LAN）
       echo 1 > /proc/sys/net/ipv4/ip_forward
-      [ -f /proc/sys/net/ipv4/conf/all/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
-      [ -f /proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter ]  && echo 2 > /proc/sys/net/ipv4/conf/${LAN_IF}/rp_filter
-      [ -f /proc/sys/net/ipv4/conf/tailscale0/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/tailscale0/rp_filter
+
+      iptables -N TSFWD 2>/dev/null
+      iptables -C FORWARD -j TSFWD 2>/dev/null || iptables -A FORWARD -j TSFWD
+
+      # 回程放行
+      iptables -C TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null\
+      || iptables -A TSFWD -m state --state RELATED,ESTABLISHED -j ACCEPT
+      # 仅允许 LAN -> tailscale0 新建连接
+      iptables -C TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT 2>/dev/null || iptables -A TSFWD -i ${LAN_IF} -o tailscale0 -j ACCEPT
+      ;;
+    1|3)
+      # 网关/混合：双向互访
+      echo 1 > /proc/sys/net/ipv4/ip_forward
 
       iptables -N TSFWD 2>/dev/null
       iptables -C FORWARD -j TSFWD 2>/dev/null || iptables -A FORWARD -j TSFWD
@@ -219,8 +221,11 @@ disable_forwarding_v4() {
 
 # ---- IPv6：仅允许 tailscale0 访问路由器本机，不做转发/NAT ----
 enable_forwarding_v6() {
-  [ "$tailscale_ipv6_enable" = "1" ] || return 0
+  # 总是允许 tailscale0 访问本机（IPv6）
   ip6tables -C INPUT -i tailscale0 -j ACCEPT 2>/dev/null || ip6tables -I INPUT 1 -i tailscale0 -j ACCEPT
+  # 不做 v6 转发/NAT
+  [ "$tailscale_ipv6_enable" = "1" ] || return 0
+  return 0
 }
 
 disable_forwarding_v6() {
@@ -242,19 +247,42 @@ disable_forwarding() {
   disable_forwarding_v6
 }
 
+check_binaries() {
+  COMBINED="${BIN}/tailscale.combined"
+
+  # 检查 combined 主体是否存在且可执行
+  if [ ! -x "$COMBINED" ]; then
+    echo_date "错误：${COMBINED} 不存在或没有可执行权限。"
+    return 1
+  fi
+
+  # 检查软链接
+  for link in tailscaled tailscale; do
+    LINK_PATH="${BIN}/${link}"
+    if [ ! -L "$LINK_PATH" ]; then
+      echo_date "错误：${LINK_PATH} 不是软链接。"
+      return 1
+    fi
+    target="$(readlink "$LINK_PATH")"
+    if [ "$target" != "tailscale.combined" ] && [ "$target" != "${BIN}/tailscale.combined" ]; then
+      echo_date "错误：${LINK_PATH} 链接目标异常（当前指向：$target）"
+      return 1
+    fi
+  done
+
+  return 0
+}
+
 # ---------- 运行控制 ----------
 start_ts() {
   need_dirs
   get_conf
 
-  if [ ! -x "${TSD}" ] || [ ! -x "${TS}" ]; then
-    echo_date "缺少二进制：${BIN}/{tailscaled,tailscale}"
-    return 1
-  fi
+ check_binaries || return 1
 
   if ! pidof tailscaled >/dev/null 2>&1; then
     echo_date "启动 tailscaled ..."
-	GOGC=20 GOMEMLIMIT=64MiB \
+#	GOGC=20 GOMEMLIMIT=64MiB \
 	TS_DEBUG_MEMORY=1 TS_LOG_TARGET=stderr \
     "${TSD}" --state="${STATE}" --statedir="${STATE_DIR}" --socket="${SOCK}" --port=41641 > "${TSDLOG}" 2>&1 &
     sleep 2
