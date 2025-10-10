@@ -1,0 +1,118 @@
+name: Build & Commit Tailscale (ARMv5 combined + UPX 3.94)
+
+on:
+  schedule:
+    - cron: "5 4 * * 6"   # At 04:05 on Saturday
+  workflow_dispatch:
+    inputs:
+      ts_version:
+        description: "Optional: specify a Tailscale tag (e.g. v1.88.1). Leave empty to auto-detect latest stable."
+        required: false
+        default: ""
+
+permissions:
+  contents: write    # allow the workflow to commit back to the repo
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    env:
+      CGO_ENABLED: "0"
+      GOOS: linux
+      GOARCH: arm
+      GOARM: "5"
+      BUILD_TAGS: "ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube"
+      LDFLAGS: "-s -w"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl xz-utils jq build-essential ca-certificates
+
+      - name: Set up latest stable Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Resolve Tailscale version (latest stable if not provided)
+        id: resolve
+        env:
+          INPUT_TS_VERSION: "${{ inputs.ts_version }}"
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_TS_VERSION}" ]; then
+            TAG="${INPUT_TS_VERSION}"
+          else
+            TAG="$(curl -fsSL https://api.github.com/repos/tailscale/tailscale/releases/latest | jq -r '.tag_name')"
+          fi
+          [ -n "${TAG}" ] && [ "${TAG}" != "null" ] || { echo "Failed to resolve Tailscale tag"; exit 1; }
+          VER="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "ver=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved Tailscale version: ${TAG} (folder: ${VER})"
+
+      - name: Skip if version already exists
+        id: guard
+        run: |
+          if [ -d "binary/${{ steps.resolve.outputs.ver }}" ]; then
+            echo "This version already exists. Nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install UPX 3.94 (ucl)
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          curl -fsSL "https://github.com/upx/upx/releases/download/v3.94/upx-3.94-amd64_linux.tar.xz" -o upx.tar.xz
+          tar -xJf upx.tar.xz
+          sudo mv upx-3.94-amd64_linux/upx /usr/local/bin/upx
+          # Provide alias as you requested:
+          sudo ln -sf /usr/local/bin/upx /usr/local/bin/upx-ucl
+          upx-ucl -V
+
+      - name: Download Tailscale source tarball
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          TS_TAG="${{ steps.resolve.outputs.tag }}"
+          curl -fsSL "https://github.com/tailscale/tailscale/archive/refs/tags/${TS_TAG}.tar.gz" -o "tailscale-${TS_TAG}.tar.gz"
+          tar -xzf "tailscale-${TS_TAG}.tar.gz"
+          echo "SRC_DIR=tailscale-${{ steps.resolve.outputs.ver }}" >> $GITHUB_ENV
+
+      - name: Build and compress (ARMv5 combined)
+        if: steps.guard.outputs.skip == 'false'
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set -euxo pipefail
+          # Your exact build line (plus -trimpath)
+          go build -trimpath \
+            -tags "${BUILD_TAGS}" \
+            -ldflags "${LDFLAGS}" \
+            -o tailscale.combined \
+            ./cmd/tailscaled
+
+          # Compress with legacy-friendly UPX
+          upx-ucl --lzma --ultra-brute tailscale.combined || echo "UPX failed; keeping original."
+
+          FINAL_DIR="../binary/${{ steps.resolve.outputs.ver }}"
+          mkdir -p "${FINAL_DIR}"
+          mv tailscale.combined "${FINAL_DIR}/tailscale.combined"
+          ls -lh "${FINAL_DIR}"
+
+      - name: Commit and push (message = version)
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          set -e
+          VER="${{ steps.resolve.outputs.ver }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "binary/${VER}/tailscale.combined"
+          git commit -m "${VER}" || echo "No changes to commit."
+          git push
