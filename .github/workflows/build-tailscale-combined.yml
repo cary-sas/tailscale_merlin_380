@@ -22,8 +22,8 @@ jobs:
       GOOS: linux
       GOARCH: arm
       GOARM: "5"
-      BUILD_TAGS: "ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube"
-      LDFLAGS: "-s -w"
+      BUILD_TAGS: "ts_include_cli,ts_omit_aws,ts_omit_bird,ts_omit_tap,ts_omit_kube,ts_omit_completion,ts_omit_completion_scripts,ts_omit_ssh,ts_omit_taildrop,ts_omit_drive,ts_omit_systray,ts_omit_clientupdate,ts_omit_networkmanager,ts_omit_resolved,ts_omit_sdnotify,ts_omit_synology,ts_omit_wakeonlan,ts_omit_capture,ts_omit_relayserver,ts_omit_webbrowser,ts_omit_webclient"
+      LDFLAGS: "-s -w -buildid="
 
     steps:
       - name: Checkout repository
@@ -91,8 +91,7 @@ jobs:
         working-directory: ${{ env.SRC_DIR }}
         run: |
           set -euxo pipefail
-          # Your exact build line (plus -trimpath)
-          go build -trimpath \
+          go build -trimpath -buildvcs=false \
             -tags "${BUILD_TAGS}" \
             -ldflags "${LDFLAGS}" \
             -o tailscale.combined \
