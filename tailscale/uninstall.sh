@@ -32,10 +32,10 @@ dbus remove softcenter_module_tailscale_home_url
 dbus remove softcenter_module_tailscale_description
 dbus remove tailscale_enable
 dbus remove tailscale_version
-dbus remove tailscale_ipv4_enable
 dbus remove tailscale_ipv6_enable
 dbus remove tailscale_role
 dbus remove tailscale_SNAT_enable
+dbus remove tailscale_memory_limit_enable
 dbus remove tailscale_advertise_exit
 dbus remove tailscale_advertise_routes
 dbus remove tailscale_authkey

@@ -51,6 +51,7 @@ function init() {
   show_menu(menu_hook);
   buildswitches();
   conf2obj();
+  setTimeout(refreshPageStatusOnce, 1200);
   hideGlobalLoading();   // 页面就绪时再兜底隐藏一次“请稍候”条
 }
 
@@ -63,13 +64,14 @@ function buildswitches() {
   // master enable switch -> hidden input
   $("#switch_enable").on("click", function(){
     document.form.tailscale_enable.value = this.checked ? 1 : 0;
+    if (!this.checked) stopTailscaleNow();
   });
   // checkboxes -> hidden 0/1
-  $("#cb_ipv4").on("click", function(){ document.form.tailscale_ipv4_enable.value = this.checked ? 1 : 0; });
   $("#cb_ipv6").on("click", function(){ document.form.tailscale_ipv6_enable.value = this.checked ? 1 : 0; });
 //  $("#cb_accept_routes").on("click", function(){ document.form.tailscale_accept_routes.value = this.checked ? 1 : 0; });
   $("#cb_adv_exit").on("click", function(){ document.form.tailscale_advertise_exit.value = this.checked ? 1 : 0; });
   $("#cb_snat_enable").on("click", function(){ document.form.tailscale_SNAT_enable.value = this.checked ? 1 : 0; });
+  $("#cb_memory_limit").on("click", function(){ document.form.tailscale_memory_limit_enable.value = this.checked ? 1 : 0; });
   
   // 角色选择 -> 同步到 hidden，并刷新 UI
   $("#sel_role").on("change", function(){
@@ -97,11 +99,10 @@ function conf2obj() {
   E("switch_enable").checked = en;
   document.form.tailscale_enable.value = en ? 1 : 0;
 
-  var v4 = (d["tailscale_ipv4_enable"] || "1") == "1";
   var v6 = (d["tailscale_ipv6_enable"] || "1") == "1";
-  E("cb_ipv4").checked = v4;
+  E("cb_ipv4").checked = true;
+  E("cb_ipv4").disabled = true;
   E("cb_ipv6").checked = v6;
-  document.form.tailscale_ipv4_enable.value = v4 ? 1 : 0;
   document.form.tailscale_ipv6_enable.value = v6 ? 1 : 0;
 
 //  var acc = (d["tailscale_accept_routes"] || "1") == "1";
@@ -111,6 +112,10 @@ function conf2obj() {
   var ex = (d["tailscale_advertise_exit"] || "0") == "1";
   E("cb_adv_exit").checked = ex;
   document.form.tailscale_advertise_exit.value = ex ? 1 : 0;
+
+  var ml = (d["tailscale_memory_limit_enable"] || "0") == "1";
+  E("cb_memory_limit").checked = ml;
+  document.form.tailscale_memory_limit_enable.value = ml ? 1 : 0;
 
   // 私有化（Headscale）
   var pvt = (d["tailscale_private_enable"] || "0") == "1";
@@ -405,12 +410,12 @@ function onSubmitCtrl(btn, s){
 
     // dbus 同步
     tailscale_enable:           document.form.tailscale_enable.value,
-    tailscale_ipv4_enable:      document.form.tailscale_ipv4_enable.value,
     tailscale_ipv6_enable:      document.form.tailscale_ipv6_enable.value,
 //    tailscale_accept_routes:    document.form.tailscale_accept_routes.value,
     tailscale_advertise_exit:   document.form.tailscale_advertise_exit.value,
 	  tailscale_role:            (document.form.tailscale_role && document.form.tailscale_role.value) ? document.form.tailscale_role.value : "",
 	  tailscale_SNAT_enable:      document.form.tailscale_SNAT_enable.value,
+    tailscale_memory_limit_enable: document.form.tailscale_memory_limit_enable.value,
     tailscale_advertise_routes: E("tailscale_advertise_routes").value || "",
     tailscale_private_enable:   document.form.tailscale_private_enable.value,
     tailscale_login_server:     document.form.tailscale_login_server.value
@@ -465,6 +470,33 @@ function post_simple_cmd(cmd){
   });
 }
 
+function stopTailscaleNow(){
+  $.ajax({
+    type: "POST",
+    url: "/applydb.cgi?p=tailscale",
+    contentType: "application/x-www-form-urlencoded",
+    dataType: "text",
+    data: $.param({
+      current_page: "Module_tailscale.asp",
+      next_page: "Module_tailscale.asp",
+      action_mode: " Refresh ",
+      SystemCmd: "tailscale_config",
+      tailscale_enable: "0",
+      tailscale_ipv6_enable: document.form.tailscale_ipv6_enable.value,
+      tailscale_advertise_exit: document.form.tailscale_advertise_exit.value,
+      tailscale_role: document.form.tailscale_role.value,
+      tailscale_SNAT_enable: document.form.tailscale_SNAT_enable.value,
+      tailscale_memory_limit_enable: document.form.tailscale_memory_limit_enable.value,
+      tailscale_advertise_routes: E("tailscale_advertise_routes").value || "",
+      tailscale_private_enable: document.form.tailscale_private_enable.value,
+      tailscale_login_server: document.form.tailscale_login_server.value
+    }),
+    success: function(){
+      setTimeout(refreshPageStatus, 800);
+    }
+  });
+}
+
 function open_status(){
 _popup_mode = 'status';
   post_simple_cmd("tailscale_status");
@@ -477,6 +509,145 @@ _popup_mode = 'status';
   post_simple_cmd("tailscale_ncheck");
   $("#ok_button_submit").hide();
   $("#ok_button_status").show();
+}
+
+function refreshPageStatus(){
+  if (_ts_polling) return false;
+
+  var body = E("ts_iface_status_body");
+  var tip = E("ts_iface_status_tip");
+  var run = E("ts_run_status");
+  var tailnet = E("ts_tailnet_status");
+  if (run) run.innerHTML = "刷新中...";
+  if (tailnet) tailnet.innerHTML = "刷新中...";
+  if (tip) tip.innerHTML = "刷新中...";
+
+  $.ajax({
+    type: "POST",
+    url: "/applydb.cgi?p=tailscale",
+    contentType: "application/x-www-form-urlencoded",
+    dataType: "text",
+    data: $.param({
+      current_page: "Module_tailscale.asp",
+      next_page: "Module_tailscale.asp",
+      action_mode: " Refresh ",
+      SystemCmd: "tailscale_page_status"
+    }),
+    success: function(){
+      var tries = 0;
+      function poll(){
+        $.ajax({
+          url: "/cmdRet_check.htm",
+          dataType: "html",
+          success: function(response){
+            tries++;
+            if (response.indexOf("XU6J03M6") === -1 && tries < 40) {
+              setTimeout(poll, 250);
+              return;
+            }
+
+            renderPageStatus(response.replace(/XU6J03M6/g, ""));
+          },
+          error: function(){
+            if (tries++ < 20) setTimeout(poll, 500);
+            else renderPageStatus("");
+          }
+        });
+      }
+      setTimeout(poll, 250);
+    },
+    error: function(){ renderPageStatus(""); }
+  });
+
+  return false;
+}
+
+function refreshPageStatusOnce(){
+  if (_ts_polling || _popup_mode === 'status') return false;
+  return refreshPageStatus();
+}
+
+function refreshIfaceStatus(){
+  return refreshPageStatus();
+}
+
+function clearSharedCmdRet(){
+  $.ajax({
+    type: "POST",
+    url: "/applydb.cgi?p=tailscale",
+    contentType: "application/x-www-form-urlencoded",
+    dataType: "text",
+    data: $.param({
+      current_page: "Module_tailscale.asp",
+      next_page: "Module_tailscale.asp",
+      action_mode: " Refresh ",
+      SystemCmd: "tailscale_clear_log"
+    })
+  });
+}
+
+function htmlEscape(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+  });
+}
+
+function renderPageStatus(text){
+  renderControlStatus(text);
+  renderIfaceStatus(text);
+  setTimeout(clearSharedCmdRet, 300);
+}
+
+function renderControlStatus(text){
+  var run = E("ts_run_status");
+  var tailnet = E("ts_tailnet_status");
+  var rows = String(text || "").replace(/\r/g, "").split("\n");
+  var ctrl = null;
+
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].indexOf("CONTROL\t") === 0) {
+      ctrl = rows[i].split("\t");
+      break;
+    }
+  }
+
+  if (!ctrl) {
+    if (run) run.innerHTML = "获取失败";
+    if (tailnet) tailnet.innerHTML = "unknown";
+    return;
+  }
+
+  if (run) run.innerHTML = htmlEscape(ctrl[1] || "-");
+  if (tailnet) tailnet.innerHTML = htmlEscape(ctrl[2] || "-");
+}
+
+function renderIfaceStatus(text){
+  var body = E("ts_iface_status_body");
+  var tip = E("ts_iface_status_tip");
+  if (!body) return;
+
+  var rows = String(text || "").replace(/\r/g, "").split("\n").filter(function(line){
+    return line && line.indexOf("IFACE\t") === 0;
+  });
+
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="5" style="text-align:center;color:#FC0;">暂无状态</td></tr>';
+    if (tip) tip.innerHTML = "获取失败或 tailscale0 尚未创建";
+    return;
+  }
+
+  body.innerHTML = rows.map(function(line){
+    var f = line.split("\t");
+    return '<tr>'
+      + '<td>' + htmlEscape(f[1] || "-") + '</td>'
+      + '<td>' + htmlEscape(f[2] || "-") + '</td>'
+      + '<td>' + htmlEscape(f[3] || "-") + '</td>'
+      + '<td>' + htmlEscape(f[4] || "-") + '</td>'
+      + '<td>' + htmlEscape(f[5] || "-") + '</td>'
+      + '</tr>';
+  }).join("");
+
+  if (tip) tip.innerHTML = "最近刷新：" + new Date().toLocaleTimeString();
 }
 
 function close_proc_status(){
@@ -648,10 +819,10 @@ function ts_check_update(){
     <!-- hidden dbus mirrors for checkboxes -->
     <input type="hidden" id="tailscale_enable" name="tailscale_enable" value='<% dbus_get_def("tailscale_enable","0"); %>'/>
     <input type="hidden" id="tailscale_role" name="tailscale_role" value='<% dbus_get_def("tailscale_role",""); %>'/>
-    <input type="hidden" id="tailscale_ipv4_enable" name="tailscale_ipv4_enable" value='<% dbus_get_def("tailscale_ipv4_enable","1"); %>'/>
     <input type="hidden" id="tailscale_ipv6_enable" name="tailscale_ipv6_enable" value='<% dbus_get_def("tailscale_ipv6_enable","1"); %>'/>
     <!-- <input type="hidden" id="tailscale_accept_routes" name="tailscale_accept_routes" value='<% dbus_get_def("tailscale_accept_routes","1"); %>'/> -->
-  	<input type="hidden" id="tailscale_SNAT_enable" name="tailscale_SNAT_enable" value='<% dbus_get_def("tailscale_SNAT_enable","1"); %>'/>
+    <input type="hidden" id="tailscale_SNAT_enable" name="tailscale_SNAT_enable" value='<% dbus_get_def("tailscale_SNAT_enable","1"); %>'/>
+    <input type="hidden" id="tailscale_memory_limit_enable" name="tailscale_memory_limit_enable" value='<% dbus_get_def("tailscale_memory_limit_enable","0"); %>'/>
     <input type="hidden" id="tailscale_advertise_exit" name="tailscale_advertise_exit" value='<% dbus_get_def("tailscale_advertise_exit","0"); %>'/>
     <input type="hidden" id="tailscale_private_enable" name="tailscale_private_enable" value='<% dbus_get_def("tailscale_private_enable","0"); %>'/>
     <input type="hidden" id="tailscale_login_server"  name="tailscale_login_server"  value='<% dbus_get_def("tailscale_login_server",""); %>'/>
@@ -680,16 +851,15 @@ function ts_check_update(){
                         <img src="/images/New_ui/export/line_export.png">
                       </div>
 
-                      <!-- 开关 -->
                       <table style="margin:10px 0 0 0;" width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable">
-						          <thead>
+                        <thead>
                           <tr>
-                            <td colspan="2">Tailscale 开关</td>
+                            <td colspan="2">Tailscale - 状态/控制</td>
                           </tr>
                         </thead>
                         <tr>
-                          <th>启用 Tailscale</th>
-                          <td colspan="2">
+                          <th>开关</th>
+                          <td>
                             <div class="switch_field" style="display:inline-block; vertical-align:middle;">
                               <label for="switch_enable">
                                 <input id="switch_enable" class="switch" type="checkbox" style="display:none;">
@@ -699,46 +869,72 @@ function ts_check_update(){
                                 </div>
                               </label>
                             </div>
-                           <!-- 版本号显示（本地 dbus 值：相当于 `dbus get tailscale_version`） -->
                             <span id="ts_version_show" style="display:inline-block; vertical-align:middle; margin-left:2ch;">
                               <a class="hintstyle" href="javascript:void(0);">
-                              <i>当前版本：<% dbus_get_def("tailscale_version","未知"); %></i>
+                                <i>当前版本：<% dbus_get_def("tailscale_version","未知"); %></i>
                               </a>
                             </span>
-
-                            <!-- 预留“检查并更新”按钮（未来接 GitHub 最新版本比较后启用） -->
-                            <!--
-                              <div id="ts_update_button" style="display:table-cell;float:left;margin-left:120px;padding: 5.5px 0;">
-                                <a id="tsUpdateBtn" type="button" class="ss_btn" style="cursor:not-allowed;opacity:.5"
-                                  onclick="ts_check_update()" disabled>检查并更新</a>
-                              </div>
-                              -->
-                            </td>
-                          </tr>
-                        </table>
-
-                        <!-- 详细设置 -->
-                        <table style="margin:10px 0 0 0;" width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable">                  
-                      <thead>
-                          <tr>
-                            <td colspan="2">详细设置</td>
-                          </tr>
-                        </thead>
+                          </td>
+                        </tr>
                         <tr>
-                          <th>协议</th>
+                          <th>tailscaled 运行状态</th>
+                          <td><span id="ts_run_status" class="ts-status-text">等待刷新</span></td>
+                        </tr>
+                        <tr>
+                          <th>tailnet 状态</th>
+                          <td><span id="ts_tailnet_status" class="ts-status-text">等待刷新</span></td>
+                        </tr>
+                        <tr>
+                          <th>tailscale 控制台</th>
+                          <td><button class="button_gen ts-action-btn" onclick="window.open('https://login.tailscale.com/admin', '_blank'); return false;">管理控制台</button></td>
+                        </tr>
+                        <tr>
+                          <th>连接状态</th>
+                          <td class="ts-action-row">
+                            <button class="button_gen ts-action-btn" onclick="open_status(); return false;">查看状态</button>
+                            <button class="button_gen ts-action-btn" onclick="open_netcheck(); return false;">网络检测</button>
+                            <button class="button_gen ts-action-btn" onclick="return refreshPageStatus();">刷新页面状态</button>
+                          </td>
+                        </tr>
+                        <tr>
+                          <th>使用网络</th>
                           <td>
-                            IPv4 <input type="checkbox" id="cb_ipv4" style="vertical-align:middle;" checked/>
+                            IPv4 <input type="checkbox" id="cb_ipv4" style="vertical-align:middle;" checked disabled/>
                             &nbsp;&nbsp;IPv6 <input type="checkbox" id="cb_ipv6" style="vertical-align:middle;" checked/>
                           </td>
                         </tr>
                         <tr>
+                          <th>宣告路由表（--advertise-routes）</th>
+                          <td>
+                            <input type="text" id="tailscale_advertise_routes" name="tailscale_advertise_routes"
+                              class="input_ss_table" style="width:300px;"
+                              placeholder="例：192.168.1.0/24,10.0.0.0/24"/>
+                            &nbsp;&nbsp;
+                            <label title="开启：无需回程路由；关闭：需在内网网关配置回程路由">
+                              <input type="checkbox" id="cb_snat_enable" checked/> SNAT
+                            </label>
+                          </td>
+                        </tr>
+                        <tr>
+                          <th>互联网出口（--advertise-exit-node）</th>
+                          <td><label><input type="checkbox" id="cb_adv_exit"/> 将本机设为 Exit Node</label></td>
+                        </tr>
+                      </table>
+
+                      <table style="margin:10px 0 0 0;" width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable">
+                        <thead>
+                          <tr>
+                            <td colspan="2">Tailscale - 高级配置</td>
+                          </tr>
+                        </thead>
+                        <tr>
                           <th>角色</th>
                           <td>
-                          <select id="sel_role" class="input_ss_table" style="width:160px;">
-                            <option value="1">网关（子网路由）</option>
-                            <option value="2">终端（普通节点）</option>
-                            <option value="3">混合（网关+终端）</option>
-                          </select>
+                            <select id="sel_role" class="input_ss_table" style="width:190px;">
+                              <option value="1">网关（子网路由）</option>
+                              <option value="2">终端（普通节点）</option>
+                              <option value="3">混合（网关+终端）</option>
+                            </select>
                           </td>
                         </tr>
                         <tr>
@@ -752,28 +948,6 @@ function ts_check_update(){
                           </td>
                         </tr>
                         <tr>
-                          <th>Advertise routes (CIDR)</th>
-                          <td>
-
-                          <input type="text" id="tailscale_advertise_routes" name="tailscale_advertise_routes"
-                              class="input_ss_table" style="width:280px;"
-                              placeholder="例：192.168.1.0/24,10.0.0.0/24"/>
-
-                          <!-- &nbsp;&nbsp;
-                          <label><input type="checkbox" id="cb_accept_routes" checked/> 接受其它路由</label> -->
-
-                          &nbsp;&nbsp;
-                          <label title="开启：无需回程路由；关闭：需在内网网关配置回程路由">
-                            <input type="checkbox" id="cb_snat_enable" checked/> 启用 SNAT（伪装）
-                          </label>
-                          </td>
-                        </tr>
-                          <th>出口节点</th>
-                          <td>
-                            <label><input type="checkbox" id="cb_adv_exit"/> 将本机设为 Exit Node</label>
-                          </td>
-                        </tr>
-                        <tr>
                           <th>私有化部署（Headscale）</th>
                           <td>
                             <label style="margin-right:1em;">
@@ -784,15 +958,41 @@ function ts_check_update(){
                                   placeholder="例如：https://headscale.example.com"/>
                             <span class="hintstyle" style="margin-left:.5em;">用于 <code>--login-server</code></span>
                           </td>
-                      </tr>
+                        </tr>
+                        <tr>
+                          <th>内存优化</th>
+                          <td>
+                            <label title="勾选后启动 tailscaled 时使用 GOGC=20 和 GOMEMLIMIT=64MiB，适合内存较小的路由器">
+                              <input type="checkbox" id="cb_memory_limit"/> 限制 tailscaled 内存占用
+                            </label>
+                          </td>
+                        </tr>
                       </table>
 
                       <div class="apply_gen" style="margin-top:10px;">
                         <button id="cmdBtn" class="button_gen" onclick="return onSubmitCtrl(event, ' Refresh ');">保存&提交</button>
-                        <button class="button_gen" href="javascript:void(0)" onclick="open_status()">查看状态</button>
-                        <button class="button_gen" href="javascript:void(0)" onclick="open_netcheck()">网络检测</button>
-                        <button class="button_gen" onclick="window.open('https://login.tailscale.com/admin', '_blank')">管理控制台</button>
                       </div>
+
+                      <table style="margin:10px 0 0 0;" width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable">
+                        <thead>
+                          <tr>
+                            <td colspan="5">
+                              Tailscale 网口状态
+                              <span id="ts_iface_status_tip" style="float:right;font-weight:normal;color:#FC0;">未刷新</span>
+                            </td>
+                          </tr>
+                          <tr>
+                            <th class="ts-iface-head" style="width:20%;">接口</th>
+                            <th class="ts-iface-head" style="width:24%;">IP</th>
+                            <th class="ts-iface-head" style="width:18%;">下行</th>
+                            <th class="ts-iface-head" style="width:18%;">上行</th>
+                            <th class="ts-iface-head" style="width:20%;">状态</th>
+                          </tr>
+                        </thead>
+                        <tbody id="ts_iface_status_body">
+                          <tr><td colspan="5" style="text-align:center;color:#FC0;">等待刷新</td></tr>
+                        </tbody>
+                      </table>
 
                       <div style="margin-left:5px;margin-top:10px;margin-bottom:10px">
                         <img src="/images/New_ui/export/line_export.png">
@@ -845,6 +1045,20 @@ function ts_check_update(){
   }
   /* 按钮容器置中 */
   #ok_button { text-align: center; padding: 12px 0; background:#000; }
+  .ts-status-text { color:#FC0; font-weight:bold; }
+  .ts-action-row .ts-action-btn,
+  .ts-action-btn {
+    display: inline-block;
+    min-width: 118px;
+    margin: 3px 12px 3px 0;
+    text-align: center;
+    white-space: nowrap;
+  }
+  .ts-iface-head {
+    color: #fff !important;
+    font-weight: bold !important;
+    font-size: 14px !important;
+  }
 </style>
 
 </body>

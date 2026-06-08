@@ -21,4 +21,16 @@ v1.0.5
    - 修复了“客户端”角色无法连接到其他节点的问题；  
    - 测试后发现加上内存回收的参数会影响传输速度，在没有找到合适办法前先撤回这个改动； 
 v1.0.6
-   - 更新登录策略，若 state 文件存在，优先用 state（不带 --authkey）      
+   - 更新登录策略，若 state 文件存在，优先用 state（不带 --authkey）    
+v1.0.7
+   - 开机启动脚本结合 web UI 开关状态增加了条件判断；  
+   - 增加了进程守护逻辑；       
+v1.0.8
+   - 更新了二进制版本；
+   - 重构 Web UI 状态/控制区域，新增 tailscaled 运行状态、tailnet 状态、网口流量状态和刷新按钮；
+   - IPv4 改为固定启用，前端 IPv4 选项固定勾选并移除 tailscale_ipv4_enable 配置；
+   - 新增“内存优化”开关，仅勾选时才对 tailscaled 使用 GOGC=20 和 GOMEMLIMIT=64MiB；
+   - 优化 tailscaled 守护逻辑，增加健康检查、WAN IP 变化自动重启和防火墙规则周期性补回；
+   - 调整防火墙/NAT 规则：role=1 且 SNAT 关闭时不再挂载 POSTROUTING -> TSNAT，避免状态检查误报；
+   - tailscale up 失败时自动清理半启动状态，并保留脚本真实退出码；
+   - 更新 tailscale_status 检查逻辑以匹配固定 IPv4、IPv6 跳过检查和角色规则；
