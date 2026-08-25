@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       ts_version:
-        description: "Optional Tailscale tag, e.g. v1.102.2. Leave empty for latest stable."
+        description: "Optional Tailscale tag, e.g. v1.102.3. Leave empty for latest stable."
         required: false
         default: ""
         type: string
@@ -35,6 +35,7 @@ jobs:
       - name: Install system dependencies
         run: |
           set -euo pipefail
+
           sudo apt-get update -y
           sudo apt-get install -y \
             curl \
@@ -157,7 +158,7 @@ jobs:
             env -u GOOS -u GOARCH -u GOARM \
               go run ./cmd/featuretags \
                 --min \
-                --add=osrouter,advertiseroutes,advertiseexitnode,ipnbus
+                --add=osrouter,advertiseroutes,advertiseexitnode,ipnbus,iptables,dns,portmapper
           )"
 
           if [ -z "${FEATURE_TAGS}" ]; then
