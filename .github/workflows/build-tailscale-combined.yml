@@ -154,9 +154,10 @@ jobs:
           set -euo pipefail
 
           FEATURE_TAGS="$(
-            go run ./cmd/featuretags \
-              --min \
-              --add=osrouter,advertiseroutes,advertiseexitnode,ipnbus
+            env -u GOOS -u GOARCH -u GOARM \
+              go run ./cmd/featuretags \
+                --min \
+                --add=osrouter,advertiseroutes,advertiseexitnode,ipnbus
           )"
 
           if [ -z "${FEATURE_TAGS}" ]; then
