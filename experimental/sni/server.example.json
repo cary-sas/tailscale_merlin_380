@@ -1,0 +1,8 @@
+{
+  "mode": "server",
+  "peer_key": "nodekey:REPLACE_WITH_CLIENT_ROUTER_PUBLIC_NODE_KEY",
+  "listen": "0.0.0.0:18443",
+  "cert_file": "server.crt",
+  "key_file": "server.key",
+  "peer_cert": "client.crt"
+}

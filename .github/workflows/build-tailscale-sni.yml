@@ -1,0 +1,96 @@
+name: Experimental Tailscale direct TLS SNI (ARMv5)
+
+on:
+  push:
+    branches: ['experimental/direct-tls-sni']
+    paths: ['experimental/sni/**', '.github/workflows/build-tailscale-sni.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: direct-tls-sni-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout pinned upstream (v1.104.1)
+        uses: actions/checkout@v4
+        with:
+          repository: tailscale/tailscale
+          ref: 9a522a9786c97eb7910c01ccb7bd66557b04c910
+          path: upstream
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/go.mod
+          cache-dependency-path: upstream/go.sum
+      - name: Apply source changes and format Go
+        run: |
+          set -euo pipefail
+          python3 experimental/sni/apply.py upstream
+          gofmt -w upstream/wgengine/magicsock/merlin_tls*.go upstream/wgengine/magicsock/magicsock.go upstream/wgengine/magicsock/endpoint.go
+          git -C upstream diff --check
+      - name: TLS transport tests (race detector)
+        working-directory: upstream
+        run: go test -race ./wgengine/magicsock -run '^TestMerlinTLS' -count=1 -timeout=4m -v
+      - name: Select router features including ordinary UDP and NAT traversal
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          TAGS="$(go run ./cmd/featuretags --min --add=osrouter,advertiseroutes,advertiseexitnode,ipnbus,iptables,dns,portmapper,udptransport,nattraversal,health)"
+          echo "ROUTER_TAGS=ts_include_cli,${TAGS}" >> "$GITHUB_ENV"
+          printf '%s\n' "$TAGS"
+      - name: Compile native binary and check CLI
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath -tags "$ROUTER_TAGS" -o /tmp/tailscale.combined ./cmd/tailscaled
+          ln -s /tmp/tailscale.combined /tmp/tailscale
+          /tmp/tailscale version
+      - name: Build Linux ARMv5 experimental binary
+        working-directory: upstream
+        env:
+          GOOS: linux
+          GOARCH: arm
+          GOARM: '5'
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          go build -trimpath -buildvcs=false -tags "$ROUTER_TAGS" -ldflags '-s -w -buildid=' -o ../dist/tailscale.combined ./cmd/tailscaled
+          file ../dist/tailscale.combined | tee ../dist/architecture.txt
+          go version -m ../dist/tailscale.combined > ../dist/build-info.txt
+          test "$(head -c 4 ../dist/tailscale.combined | od -An -tx1 | tr -d ' \n')" = '7f454c46'
+      - name: Compress a router copy with UPX 3.94
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 https://github.com/upx/upx/releases/download/v3.94/upx-3.94-amd64_linux.tar.xz -o /tmp/upx.tar.xz
+          tar -xJf /tmp/upx.tar.xz -C /tmp
+          cp dist/tailscale.combined dist/tailscale.combined.uncompressed
+          /tmp/upx-3.94-amd64_linux/upx --lzma dist/tailscale.combined
+          /tmp/upx-3.94-amd64_linux/upx -t dist/tailscale.combined
+      - name: Package configuration, source patch and checksums
+        run: |
+          set -euo pipefail
+          cp experimental/sni/README.md dist/README.md
+          cp experimental/sni/*.example.json dist/
+          cp experimental/sni/generate-identity.sh dist/
+          cp experimental/sni/enable-startup.py dist/
+          cp -R experimental/sni dist/source
+          git -C upstream diff --binary > dist/upstream-integration.patch
+          printf 'Upstream: v1.104.1\nCommit: 9a522a9786c97eb7910c01ccb7bd66557b04c910\nExperiment: direct TLS SNI v0.1\nPatch commit: %s\n' "$GITHUB_SHA" > dist/BUILD.txt
+          cd dist
+          sha256sum tailscale.combined tailscale.combined.uncompressed > SHA256SUMS
+      - name: Upload experimental build
+        uses: actions/upload-artifact@v4
+        with:
+          name: tailscale-1.104.1-merlin-direct-tls-sni-armv5
+          path: dist/
+          retention-days: 30
+          if-no-files-found: error
