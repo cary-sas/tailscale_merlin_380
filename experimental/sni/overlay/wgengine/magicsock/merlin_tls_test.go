@@ -2,6 +2,7 @@ package magicsock
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -10,13 +11,49 @@ import (
 	"encoding/pem"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/tailscale/wireguard-go/conn"
 	"tailscale.com/types/key"
 )
+
+// Exercise the patched endpoint.send path, not just the TLS helper.
+func TestMerlinTLSEndpointSendAndFailClosed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr := &merlinTLS{peer: key.NewNode().Public(), ctx: ctx, tx: make(chan []byte, 1)}
+	tr.connected.Store(true)
+	c := &Conn{}
+	c.merlinTLS.Store(tr)
+	ep := &endpoint{c: c, publicKey: tr.peer, heartbeatDisabled: true}
+	if err := ep.send([][]byte{[]byte("skip-payload")}, 5); err != nil { t.Fatal(err) }
+	if got := <-tr.tx; string(got) != "payload" { t.Fatalf("queued %q", got) }
+	tr.connected.Store(false)
+	if err := ep.send([][]byte{[]byte("payload")}, 0); err == nil { t.Fatal("disconnected peer did not fail closed") }
+	tr.connected.Store(true)
+	ep.expired = true
+	if err := ep.send([][]byte{[]byte("payload")}, 0); err != errExpired { t.Fatalf("expired peer: %v", err) }
+	if len(tr.tx) != 0 { t.Fatal("expired peer transmitted") }
+}
+
+func TestMerlinTLSReceiveUnblocksOnClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr := &merlinTLS{ctx: ctx, rx: make(chan []byte)}
+	c := &Conn{}
+	recv := c.merlinTLSReceive(tr)
+	done := make(chan error, 1)
+	go func() { _, err := recv(make([]byte, 1500), make([]conn.ReceivedPacket, 1)); done <- err }()
+	cancel()
+	select {
+	case err := <-done: if err != net.ErrClosed { t.Fatalf("receive error: %v", err) }
+	case <-time.After(time.Second): t.Fatal("receive did not unblock")
+	}
+}
 
 func merlinTestCert(t *testing.T, name string) (string, string) {
 	t.Helper()
